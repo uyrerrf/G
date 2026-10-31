@@ -9,9 +9,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.19.0
-      - key: NPM_CONFIG_BUILD_FROM_SOURCE
-        value: "true"
-      - key: AUTH_TOKEN
-        sync: false
       - key: PORT
-        value: "5000"
+        value: "10000"  # ← Match Render's external port expectation
+        
