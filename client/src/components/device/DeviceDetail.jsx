@@ -171,8 +171,8 @@ export default function DeviceDetail({ onBack }) {
 
       <MenuRow icon="📱" label="Informações Gerais"   onClick={() => sendCmd('GET_DEVICE_INFO')} />
       <MenuRow icon="📺" label="Tela ao Vivo"         onClick={() => go('reader')}
-      <MenuRow icon="🖥" label="VNC Direto"            onClick={() => go('screen')} />
         badge={d.vnc_active ? 'ATIVO' : null} highlight />
+      <MenuRow icon="🖥" label="VNC Direto"            onClick={() => go('screen')} />
       <MenuRow icon="📷" label="Câmera ao Vivo"       onClick={() => go('camera')}
         badge={d.camera_active ? 'ATIVO' : null} />
       <MenuRow icon="🎤" label="Áudio ao Vivo"        onClick={() => go('audio')}
