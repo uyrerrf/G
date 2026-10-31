@@ -2,7 +2,7 @@ services:
   - type: web
     name: oxy-c2
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install && npm run build --workspace=client
     startCommand: npm run start --workspace=server
     healthCheckPath: /api/stats
