@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: oxy-c2
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build --workspace=client
+    startCommand: npm run start --workspace=server
+    healthCheckPath: /api/stats
+    envVars:
+      - key: NODE_VERSION
+        value: 20.19.0
+      - key: NPM_CONFIG_BUILD_FROM_SOURCE
+        value: "true"
+      - key: AUTH_TOKEN
+        sync: false
+      - key: PORT
+        value: "5000"
