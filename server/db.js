@@ -2,7 +2,10 @@
 const Database = require('better-sqlite3');
 const path     = require('path');
 
+const fs = require('fs');
 const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'oxy.db');
+const dbDir = path.dirname(DB_FILE);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db      = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous  = NORMAL');
