@@ -2,7 +2,7 @@
 
 // ── Live connections ───────────────────────────────────────────────────────────
 // device_id → { ws, deviceId, ip, lastSeen }
-const devices   = new Map();
+const devices    = new Map();
 // Set<WebSocket>
 const dashboards = new Set();
 
@@ -11,9 +11,9 @@ const vncSubs    = new Map();
 const cameraSubs = new Map();
 const audioSubs  = new Map();
 
-// VNC frame rate limiter per (dashboard ws, device_id)
+// VNC rate limiter per (dashboard ws, device_id) — raised to 60 fps
 const vncRateLimiter = new WeakMap();
-const VNC_MIN_MS     = Math.floor(1000 / 30); // 30 fps cap
+const VNC_MIN_MS     = Math.floor(1000 / 60); // 60 fps cap (was 30)
 
 function getOrCreate(map, key) {
   if (!map.has(key)) map.set(key, new Set());
@@ -21,7 +21,6 @@ function getOrCreate(map, key) {
 }
 
 function isOpen(ws) {
-  // readyState === 1 === OPEN — avoid importing ws just for the constant
   return ws && ws.readyState === 1;
 }
 
@@ -58,6 +57,7 @@ function relayVncFrame(deviceId, jpegBuf) {
     if (now - (devMap.get(deviceId) || 0) < VNC_MIN_MS) continue;
     devMap.set(deviceId, now);
     try {
+      // Send meta tag so client knows which device this binary frame belongs to
       ws.send(JSON.stringify({ type: 'vnc_meta', device_id: deviceId, ts: now }));
       ws.send(jpegBuf, { binary: true });
     } catch (_) {}
