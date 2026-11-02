@@ -1,4 +1,4 @@
- * LiveScreen — HVNC · LY · V2 · DUPLO
+  /** LiveScreen — HVNC · LY · V2 · DUPLO
  */
 import {
   useEffect, useRef, useState, useCallback, useLayoutEffect,
