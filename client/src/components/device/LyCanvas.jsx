@@ -206,8 +206,11 @@ function drawLY(canvas, nodes, options = {}) {
         ctx.globalAlpha = baseAlpha * 0.18;
         ctx.fillStyle   = col;
         ctx.beginPath();
-        ctx.roundRect?.(x + inset, y + inset, w - inset * 2, h - inset * 2, r) ||
+        if (ctx.roundRect) {
+          ctx.roundRect(x + inset, y + inset, w - inset * 2, h - inset * 2, r);
+        } else {
           ctx.rect(x + inset, y + inset, w - inset * 2, h - inset * 2);
+        }
         ctx.fill();
         ctx.globalAlpha = 1;
       }
@@ -284,7 +287,7 @@ function drawLY(canvas, nodes, options = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Hit-test: canvas CSS px → device px → smallest containing node
 function hitTest(cssPx, canvas, scale, nodes) {
-  if (!scale || !canvas) return null;
+  if (!scale || !canvas) return { node: null, devX: 0, devY: 0 };
   const r    = canvas.getBoundingClientRect();
   const devX = ((cssPx.x - r.left) / r.width)  * scale.maxX;
   const devY = ((cssPx.y - r.top)  / r.height) * scale.maxY;
@@ -341,3 +344,6 @@ const LyCanvas = forwardRef(function LyCanvas(
     />
   );
 });
+
+export { LyCanvas, nodeColor };
+export default LyCanvas;
