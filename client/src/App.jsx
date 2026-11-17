@@ -23,9 +23,15 @@ export default function App() {
   const tab = useStore(s => s.tab);
 
   useEffect(() => {
+    // WS sends device_list + online_set + stats on connect via _sendInitialState.
+    // HTTP fetch of /api/stats is kept only for initial skeleton before WS connects.
     ws.connect();
-    fetch('/api/stats').then(r => r.json()).then(s => useStore.getState().setStats(s)).catch(() => {});
-    fetch('/api/devices').then(r => r.json()).then(d => useStore.getState().setDevices(d)).catch(() => {});
+    fetch('/api/stats')
+      .then(r => r.json())
+      .then(s => useStore.getState().setStats(s))
+      .catch(() => {});
+    // /api/devices removed — device_list from WS is the authoritative source
+    // and avoids the race where HTTP replaces real-time online status.
   }, []);
 
   const PAGES = {
